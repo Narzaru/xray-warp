@@ -1,0 +1,25 @@
+{
+  "outbounds": [
+    {
+      "tag": "warp-out",
+      "protocol": "socks",
+      "settings": {
+        "servers": [
+          {
+            "address": "warp",
+            "port": 1080
+          }
+        ]
+      }
+    }
+  ],
+  "routing": {
+    "rules": [
+      {
+        "type": "field",
+        "outboundTag": "warp-out",
+        "network": "tcp,udp"
+      }
+    ]
+  }
+}

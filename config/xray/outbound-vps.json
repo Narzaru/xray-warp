@@ -1,0 +1,40 @@
+{
+  "outbounds": [
+    {
+      "tag": "vps-out",
+      "protocol": "vless",
+      "settings": {
+        "vnext": [
+          {
+            "address": "${VPS_ADDRESS}",
+            "port": ${VPS_PORT},
+            "users": [
+              {
+                "id": "${VPS_UUID}",
+                "encryption": "none",
+                "flow": ""
+              }
+            ]
+          }
+        ]
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "tls",
+        "tlsSettings": {
+          "serverName": "${VPS_SNI}",
+          "allowInsecure": false
+        }
+      }
+    }
+  ],
+  "routing": {
+    "rules": [
+      {
+        "type": "field",
+        "outboundTag": "vps-out",
+        "network": "tcp,udp"
+      }
+    ]
+  }
+}

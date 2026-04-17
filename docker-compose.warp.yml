@@ -1,0 +1,19 @@
+# Подключается поверх docker-compose.yml при PROXY_MODE=warp.
+# Добавляет Cloudflare WARP как SOCKS5-прокси на warp:1080.
+#
+# Использование:
+#   docker-compose -f docker-compose.yml -f docker-compose.warp.yml up -d
+
+services:
+  warp:
+    image: caomingjun/warp:latest
+    container_name: warp
+    restart: always
+    cap_add:
+      - NET_ADMIN
+    sysctls:
+      - net.ipv6.conf.all.disable_ipv6=0
+      - net.ipv4.conf.all.src_valid_mark=1
+    networks:
+      - xray-net
+

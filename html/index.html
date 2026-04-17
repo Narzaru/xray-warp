@@ -1,0 +1,626 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Корпоративный портал — ГТС Холдинг</title>
+    <style>
+        *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            background: #f0f2f5;
+            color: #1d2433;
+            font-size: 14px;
+            line-height: 1.5;
+        }
+
+        a { color: #1a56db; text-decoration: none; }
+        a:hover { text-decoration: underline; }
+
+        /* ── Header ── */
+        .topbar {
+            background: #1e3a5f;
+            color: #c8d8ed;
+            font-size: 12px;
+            padding: 4px 24px;
+            display: flex;
+            justify-content: space-between;
+        }
+        .topbar a { color: #c8d8ed; }
+        .topbar a:hover { color: #fff; text-decoration: none; }
+
+        header {
+            background: #fff;
+            border-bottom: 3px solid #1a56db;
+            padding: 0 24px;
+            display: flex;
+            align-items: stretch;
+            gap: 0;
+        }
+
+        .header-brand {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            padding: 12px 24px 12px 0;
+            border-right: 1px solid #e5e7eb;
+            margin-right: 8px;
+        }
+
+        .header-logo {
+            width: 40px;
+            height: 40px;
+            background: #1a56db;
+            border-radius: 6px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: #fff;
+            font-weight: 800;
+            font-size: 16px;
+            flex-shrink: 0;
+        }
+
+        .brand-text .name { font-size: 16px; font-weight: 700; color: #1d2433; }
+        .brand-text .sub  { font-size: 11px; color: #6b7280; }
+
+        nav {
+            display: flex;
+            align-items: stretch;
+            flex: 1;
+        }
+
+        nav a {
+            display: flex;
+            align-items: center;
+            padding: 0 16px;
+            font-size: 13px;
+            color: #374151;
+            border-bottom: 3px solid transparent;
+            margin-bottom: -3px;
+            transition: color .15s, border-color .15s;
+            white-space: nowrap;
+        }
+
+        nav a:hover { color: #1a56db; border-bottom-color: #1a56db; text-decoration: none; }
+        nav a.active { color: #1a56db; border-bottom-color: #1a56db; font-weight: 600; }
+
+        .header-right {
+            display: flex;
+            align-items: center;
+            gap: 16px;
+            margin-left: auto;
+            padding-left: 16px;
+        }
+
+        .user-chip {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-size: 13px;
+            color: #374151;
+        }
+
+        .avatar {
+            width: 30px;
+            height: 30px;
+            background: #dbeafe;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-weight: 700;
+            font-size: 12px;
+            color: #1a56db;
+        }
+
+        /* ── VPN Banner ── */
+        .vpn-banner {
+            background: #fffbeb;
+            border-bottom: 1px solid #fde68a;
+            padding: 10px 24px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            font-size: 13px;
+            color: #92400e;
+        }
+
+        .vpn-icon {
+            width: 18px;
+            height: 18px;
+            flex-shrink: 0;
+            background: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%2392400e' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z'/%3E%3C/svg%3E") center/contain no-repeat;
+        }
+
+        /* ── Layout ── */
+        .layout {
+            display: grid;
+            grid-template-columns: 220px 1fr 260px;
+            gap: 16px;
+            max-width: 1280px;
+            margin: 20px auto;
+            padding: 0 24px;
+        }
+
+        /* ── Sidebar left ── */
+        .sidebar-nav { display: flex; flex-direction: column; gap: 4px; }
+
+        .sidebar-section {
+            background: #fff;
+            border: 1px solid #e5e7eb;
+            border-radius: 6px;
+            overflow: hidden;
+        }
+
+        .sidebar-section-title {
+            background: #f9fafb;
+            border-bottom: 1px solid #e5e7eb;
+            padding: 8px 14px;
+            font-size: 11px;
+            font-weight: 700;
+            color: #6b7280;
+            text-transform: uppercase;
+            letter-spacing: .05em;
+        }
+
+        .sidebar-link {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 9px 14px;
+            font-size: 13px;
+            color: #374151;
+            border-bottom: 1px solid #f3f4f6;
+            transition: background .1s;
+        }
+
+        .sidebar-link:last-child { border-bottom: none; }
+        .sidebar-link:hover { background: #f0f9ff; color: #1a56db; text-decoration: none; }
+        .sidebar-link.active { background: #eff6ff; color: #1a56db; font-weight: 600; }
+
+        .sidebar-link .dot {
+            width: 7px;
+            height: 7px;
+            border-radius: 50%;
+            flex-shrink: 0;
+        }
+
+        .dot-blue   { background: #3b82f6; }
+        .dot-green  { background: #22c55e; }
+        .dot-orange { background: #f97316; }
+        .dot-purple { background: #a855f7; }
+        .dot-gray   { background: #9ca3af; }
+
+        /* ── Main content ── */
+        .main { display: flex; flex-direction: column; gap: 16px; min-width: 0; }
+
+        .card {
+            background: #fff;
+            border: 1px solid #e5e7eb;
+            border-radius: 6px;
+            overflow: hidden;
+        }
+
+        .card-header {
+            padding: 12px 16px;
+            border-bottom: 1px solid #e5e7eb;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+
+        .card-header h2 { font-size: 14px; font-weight: 700; }
+        .card-header a  { font-size: 12px; color: #1a56db; }
+
+        /* Announcements */
+        .announcement {
+            padding: 14px 16px;
+            border-bottom: 1px solid #f3f4f6;
+            display: grid;
+            grid-template-columns: auto 1fr;
+            gap: 12px;
+        }
+
+        .announcement:last-child { border-bottom: none; }
+
+        .ann-date {
+            text-align: center;
+            background: #eff6ff;
+            border-radius: 6px;
+            padding: 6px 10px;
+            flex-shrink: 0;
+            width: 52px;
+        }
+        .ann-date .day   { font-size: 18px; font-weight: 800; color: #1a56db; line-height: 1; }
+        .ann-date .month { font-size: 10px; color: #6b7280; text-transform: uppercase; margin-top: 2px; }
+
+        .ann-body h3 { font-size: 13px; font-weight: 600; margin-bottom: 3px; }
+        .ann-body p  { font-size: 12px; color: #6b7280; }
+
+        .tag {
+            display: inline-block;
+            padding: 1px 7px;
+            border-radius: 4px;
+            font-size: 10px;
+            font-weight: 600;
+            margin-left: 6px;
+            vertical-align: middle;
+        }
+
+        .tag-red    { background: #fef2f2; color: #dc2626; }
+        .tag-blue   { background: #eff6ff; color: #1d4ed8; }
+        .tag-green  { background: #f0fdf4; color: #16a34a; }
+        .tag-orange { background: #fff7ed; color: #ea580c; }
+
+        /* News */
+        .news-item {
+            padding: 14px 16px;
+            border-bottom: 1px solid #f3f4f6;
+        }
+        .news-item:last-child { border-bottom: none; }
+        .news-item h3 { font-size: 13px; font-weight: 600; margin-bottom: 4px; }
+        .news-item p  { font-size: 12px; color: #6b7280; }
+        .news-meta    { font-size: 11px; color: #9ca3af; margin-top: 6px; }
+
+        /* Quick links */
+        .quick-links {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 1px;
+            background: #f3f4f6;
+        }
+
+        .quick-link {
+            background: #fff;
+            padding: 16px;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 8px;
+            text-align: center;
+            transition: background .1s;
+        }
+
+        .quick-link:hover { background: #f0f9ff; text-decoration: none; }
+
+        .ql-icon {
+            width: 40px;
+            height: 40px;
+            border-radius: 8px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 20px;
+        }
+
+        .quick-link span { font-size: 12px; color: #374151; font-weight: 500; }
+
+        /* ── Right sidebar ── */
+        .sidebar-right { display: flex; flex-direction: column; gap: 16px; }
+
+        .event-item {
+            padding: 10px 14px;
+            border-bottom: 1px solid #f3f4f6;
+            display: flex;
+            gap: 10px;
+        }
+        .event-item:last-child { border-bottom: none; }
+
+        .event-bar {
+            width: 3px;
+            border-radius: 3px;
+            flex-shrink: 0;
+        }
+
+        .event-body h4 { font-size: 12px; font-weight: 600; margin-bottom: 2px; }
+        .event-body p  { font-size: 11px; color: #6b7280; }
+
+        /* Contacts */
+        .contact-item {
+            padding: 10px 14px;
+            border-bottom: 1px solid #f3f4f6;
+        }
+        .contact-item:last-child { border-bottom: none; }
+        .contact-dept { font-size: 12px; font-weight: 600; margin-bottom: 2px; }
+        .contact-info { font-size: 11px; color: #6b7280; }
+
+        /* ── Footer ── */
+        footer {
+            background: #fff;
+            border-top: 1px solid #e5e7eb;
+            padding: 14px 24px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            font-size: 11px;
+            color: #9ca3af;
+            margin-top: 24px;
+        }
+
+        footer a { color: #9ca3af; }
+        footer a:hover { color: #6b7280; }
+
+        @media (max-width: 960px) {
+            .layout { grid-template-columns: 1fr; }
+            .sidebar-left, .sidebar-right { display: none; }
+        }
+    </style>
+</head>
+<body>
+
+<div class="topbar">
+    <span>ГТС Холдинг &nbsp;·&nbsp; Корпоративный портал v3.4</span>
+    <span>
+        <a href="#">Служба поддержки</a> &nbsp;|&nbsp;
+        <a href="#">helpdesk@gts-holding.ru</a> &nbsp;|&nbsp;
+        Пн–Пт 9:00–18:00
+    </span>
+</div>
+
+<header>
+    <div class="header-brand">
+        <div class="header-logo">ГТС</div>
+        <div class="brand-text">
+            <div class="name">ГТС Холдинг</div>
+            <div class="sub">Внутренний корпоративный портал</div>
+        </div>
+    </div>
+    <nav>
+        <a href="#" class="active">Главная</a>
+        <a href="#">Новости</a>
+        <a href="#">Документы</a>
+        <a href="#">Сотрудники</a>
+        <a href="#">ИТ-сервисы</a>
+        <a href="#">Обучение</a>
+        <a href="#">Заявки</a>
+    </nav>
+    <div class="header-right">
+        <div class="user-chip">
+            <div class="avatar">АИ</div>
+            <span>Иванов А.И.</span>
+        </div>
+    </div>
+</header>
+
+<div class="vpn-banner">
+    <div class="vpn-icon"></div>
+    <strong>Для доступа к внутренним ресурсам необходимо подключение через корпоративный VPN.</strong>
+    &nbsp;Инструкция по подключению: <a href="#" style="color:#92400e;text-decoration:underline;">Confluence → ИТ → VPN</a>
+</div>
+
+<div class="layout">
+
+    <!-- Left sidebar -->
+    <aside class="sidebar-left">
+        <div class="sidebar-nav">
+            <div class="sidebar-section">
+                <div class="sidebar-section-title">Подразделения</div>
+                <a href="#" class="sidebar-link"><span class="dot dot-blue"></span>Дирекция</a>
+                <a href="#" class="sidebar-link"><span class="dot dot-green"></span>Отдел кадров</a>
+                <a href="#" class="sidebar-link"><span class="dot dot-orange"></span>Бухгалтерия</a>
+                <a href="#" class="sidebar-link"><span class="dot dot-purple"></span>Юридический отдел</a>
+                <a href="#" class="sidebar-link"><span class="dot dot-blue"></span>ИТ-департамент</a>
+                <a href="#" class="sidebar-link"><span class="dot dot-green"></span>Маркетинг</a>
+                <a href="#" class="sidebar-link"><span class="dot dot-gray"></span>Логистика</a>
+            </div>
+
+            <div class="sidebar-section" style="margin-top:12px;">
+                <div class="sidebar-section-title">Сервисы</div>
+                <a href="#" class="sidebar-link">📧&nbsp; Корпоративная почта</a>
+                <a href="#" class="sidebar-link">📁&nbsp; Документооборот</a>
+                <a href="#" class="sidebar-link">🎫&nbsp; Helpdesk</a>
+                <a href="#" class="sidebar-link">📅&nbsp; Booking переговорных</a>
+                <a href="#" class="sidebar-link">🧾&nbsp; Авансовые отчёты</a>
+                <a href="#" class="sidebar-link">📊&nbsp; BI-отчётность</a>
+            </div>
+
+            <div class="sidebar-section" style="margin-top:12px;">
+                <div class="sidebar-section-title">Мои ссылки</div>
+                <a href="#" class="sidebar-link">Мои заявки</a>
+                <a href="#" class="sidebar-link">Расчётные листы</a>
+                <a href="#" class="sidebar-link">График отпусков</a>
+                <a href="#" class="sidebar-link">Структура компании</a>
+            </div>
+        </div>
+    </aside>
+
+    <!-- Main -->
+    <main class="main">
+
+        <!-- Announcements -->
+        <div class="card">
+            <div class="card-header">
+                <h2>Объявления</h2>
+                <a href="#">Все объявления →</a>
+            </div>
+
+            <div class="announcement">
+                <div class="ann-date"><div class="day">20</div><div class="month">янв</div></div>
+                <div class="ann-body">
+                    <h3>Перенос корпоративной почты на новую платформу <span class="tag tag-red">Важно</span></h3>
+                    <p>20 января с 22:00 до 02:00 будет проводиться миграция почтовых ящиков. В это время доступ к почте будет ограничен. Заранее сохраните необходимые письма локально.</p>
+                </div>
+            </div>
+
+            <div class="announcement">
+                <div class="ann-date"><div class="day">17</div><div class="month">янв</div></div>
+                <div class="ann-body">
+                    <h3>Обновление политики информационной безопасности <span class="tag tag-blue">ИБ</span></h3>
+                    <p>Введены новые требования к паролям и двухфакторной аутентификации. Все сотрудники обязаны ознакомиться до 31 января. Документ доступен в разделе «Документы → ИБ».</p>
+                </div>
+            </div>
+
+            <div class="announcement">
+                <div class="ann-date"><div class="day">15</div><div class="month">янв</div></div>
+                <div class="ann-body">
+                    <h3>Плановые технические работы <span class="tag tag-orange">Обслуживание</span></h3>
+                    <p>25 января с 02:00 до 05:00 МСК — профилактическое обслуживание серверной инфраструктуры. Возможны кратковременные перебои в работе внутренних сервисов.</p>
+                </div>
+            </div>
+
+            <div class="announcement">
+                <div class="ann-date"><div class="day">12</div><div class="month">янв</div></div>
+                <div class="ann-body">
+                    <h3>Открытие нового офиса в Екатеринбурге <span class="tag tag-green">Компания</span></h3>
+                    <p>С 1 февраля начинает работу офис на ул. Малышева, 51. Переезд сотрудников уральского филиала — согласно расписанию в разделе «Новости».</p>
+                </div>
+            </div>
+        </div>
+
+        <!-- Quick links -->
+        <div class="card">
+            <div class="card-header"><h2>Быстрый доступ</h2></div>
+            <div class="quick-links">
+                <a href="#" class="quick-link">
+                    <div class="ql-icon" style="background:#eff6ff;">👤</div>
+                    <span>Личный кабинет</span>
+                </a>
+                <a href="#" class="quick-link">
+                    <div class="ql-icon" style="background:#f0fdf4;">🎫</div>
+                    <span>Создать заявку в IT</span>
+                </a>
+                <a href="#" class="quick-link">
+                    <div class="ql-icon" style="background:#fff7ed;">🧾</div>
+                    <span>Авансовый отчёт</span>
+                </a>
+                <a href="#" class="quick-link">
+                    <div class="ql-icon" style="background:#fdf4ff;">📅</div>
+                    <span>Заказать пропуск</span>
+                </a>
+                <a href="#" class="quick-link">
+                    <div class="ql-icon" style="background:#fef2f2;">📊</div>
+                    <span>Отчётность</span>
+                </a>
+                <a href="#" class="quick-link">
+                    <div class="ql-icon" style="background:#f0fdf4;">📚</div>
+                    <span>База знаний</span>
+                </a>
+            </div>
+        </div>
+
+        <!-- News -->
+        <div class="card">
+            <div class="card-header">
+                <h2>Новости компании</h2>
+                <a href="#">Все новости →</a>
+            </div>
+            <div class="news-item">
+                <h3>ГТС Холдинг вошёл в рейтинг «Лучшие работодатели России — 2025»</h3>
+                <p>По итогам ежегодного исследования HeadHunter компания заняла 14-е место в категории «Технологии и телекоммуникации». Ключевым фактором оценки стала программа развития сотрудников.</p>
+                <div class="news-meta">14 января 2026 &nbsp;·&nbsp; Отдел кадров</div>
+            </div>
+            <div class="news-item">
+                <h3>Итоги года: выручка группы выросла на 23%</h3>
+                <p>Генеральный директор Михаил Соколов представил предварительные финансовые результаты за 2025 год. Полный отчёт будет опубликован в феврале после аудиторской проверки.</p>
+                <div class="news-meta">9 января 2026 &nbsp;·&nbsp; Дирекция</div>
+            </div>
+            <div class="news-item">
+                <h3>Запущена программа добровольного медицинского страхования для семей сотрудников</h3>
+                <p>С 1 февраля 2026 года родственники сотрудников могут быть включены в корпоративный полис ДМС на льготных условиях. Заявки принимаются до 24 января.</p>
+                <div class="news-meta">6 января 2026 &nbsp;·&nbsp; Отдел кадров</div>
+            </div>
+        </div>
+
+    </main>
+
+    <!-- Right sidebar -->
+    <aside class="sidebar-right">
+
+        <div class="card">
+            <div class="card-header"><h2>Ближайшие события</h2></div>
+            <div class="event-item">
+                <div class="event-bar" style="background:#3b82f6;"></div>
+                <div class="event-body">
+                    <h4>Ежеквартальный отчёт Q4</h4>
+                    <p>31 января, 11:00 &nbsp;·&nbsp; Переговорная А-3</p>
+                </div>
+            </div>
+            <div class="event-item">
+                <div class="event-bar" style="background:#22c55e;"></div>
+                <div class="event-body">
+                    <h4>Тренинг по ИБ (обязательный)</h4>
+                    <p>15 февраля, 10:00 &nbsp;·&nbsp; Zoom</p>
+                </div>
+            </div>
+            <div class="event-item">
+                <div class="event-bar" style="background:#f97316;"></div>
+                <div class="event-body">
+                    <h4>День открытых дверей ИТ-департамента</h4>
+                    <p>20 февраля, 14:00 &nbsp;·&nbsp; Конференц-зал</p>
+                </div>
+            </div>
+            <div class="event-item">
+                <div class="event-bar" style="background:#a855f7;"></div>
+                <div class="event-body">
+                    <h4>Корпоративное совещание</h4>
+                    <p>28 февраля, 09:30 &nbsp;·&nbsp; Онлайн</p>
+                </div>
+            </div>
+        </div>
+
+        <div class="card">
+            <div class="card-header"><h2>Контакты</h2></div>
+            <div class="contact-item">
+                <div class="contact-dept">Служба поддержки IT</div>
+                <div class="contact-info">helpdesk@gts-holding.ru &nbsp;·&nbsp; доб. 1001</div>
+            </div>
+            <div class="contact-item">
+                <div class="contact-dept">Отдел кадров</div>
+                <div class="contact-info">hr@gts-holding.ru &nbsp;·&nbsp; доб. 1020</div>
+            </div>
+            <div class="contact-item">
+                <div class="contact-dept">Бухгалтерия</div>
+                <div class="contact-info">acc@gts-holding.ru &nbsp;·&nbsp; доб. 1035</div>
+            </div>
+            <div class="contact-item">
+                <div class="contact-dept">Юридический отдел</div>
+                <div class="contact-info">legal@gts-holding.ru &nbsp;·&nbsp; доб. 1048</div>
+            </div>
+            <div class="contact-item">
+                <div class="contact-dept">Охрана / бюро пропусков</div>
+                <div class="contact-info">доб. 0000 &nbsp;·&nbsp; круглосуточно</div>
+            </div>
+        </div>
+
+        <div class="card">
+            <div class="card-header"><h2>Статус сервисов</h2></div>
+            <div style="padding:12px 14px;display:flex;flex-direction:column;gap:8px;">
+                <div style="display:flex;justify-content:space-between;font-size:12px;">
+                    <span>Корпоративная почта</span>
+                    <span style="color:#16a34a;font-weight:600;">● Работает</span>
+                </div>
+                <div style="display:flex;justify-content:space-between;font-size:12px;">
+                    <span>VPN-шлюз</span>
+                    <span style="color:#16a34a;font-weight:600;">● Работает</span>
+                </div>
+                <div style="display:flex;justify-content:space-between;font-size:12px;">
+                    <span>Документооборот</span>
+                    <span style="color:#16a34a;font-weight:600;">● Работает</span>
+                </div>
+                <div style="display:flex;justify-content:space-between;font-size:12px;">
+                    <span>Helpdesk</span>
+                    <span style="color:#16a34a;font-weight:600;">● Работает</span>
+                </div>
+                <div style="display:flex;justify-content:space-between;font-size:12px;">
+                    <span>BI-отчётность</span>
+                    <span style="color:#d97706;font-weight:600;">⚠ Замедление</span>
+                </div>
+            </div>
+        </div>
+
+    </aside>
+</div>
+
+<footer>
+    <span>© 2026 ГТС Холдинг &nbsp;·&nbsp; Корпоративный портал &nbsp;·&nbsp; Только для внутреннего использования</span>
+    <span>
+        <a href="#">Политика конфиденциальности</a> &nbsp;|&nbsp;
+        <a href="#">Правила использования</a> &nbsp;|&nbsp;
+        <a href="#">Сообщить об ошибке</a>
+    </span>
+</footer>
+
+</body>
+</html>

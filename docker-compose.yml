@@ -1,0 +1,109 @@
+services:
+
+  # ── Мультиплексор порта 443 ──────────────────────────────────────────────
+  # SSH  → host sshd
+  # TLS  → 3x-ui XRay :10000 (XRay сам терминирует TLS и делает fallback)
+  sslh:
+    image: ghcr.io/yrutschle/sslh:latest
+    container_name: sslh
+    restart: always
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "443:443"
+    command:
+      - --foreground
+      - --listen=0.0.0.0:443
+      - --ssh=host.docker.internal:${SSH_PORT:-22}
+      - --tls=3x-ui:10000
+      - --anyprot=3x-ui:10000
+    networks:
+      - xray-net
+    depends_on:
+      3x-ui:
+        condition: service_healthy
+
+  # ── Фейковый сайт ────────────────────────────────────────────────────────
+  # Порт 80  : ACME challenge (certbot) + редирект на 443
+  # Порт 8080: plain HTTP — XRay fallback (TLS уже снят в XRay)
+  nginx:
+    image: nginx:alpine
+    container_name: nginx
+    restart: always
+    ports:
+      - "80:80"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./html:/var/www/html:ro
+      - ./certbot/www:/var/www/certbot:ro
+      - ./logs/nginx:/var/log/nginx
+    networks:
+      - xray-net
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ── Панель управления + встроенный XRay ──────────────────────────────────
+  # Порт 2053 : веб-панель (только через SSH-туннель: ssh -L 2053:localhost:2053 -p 443 user@server)
+  # Порт 10000: XRay inbound — принимает TLS, VLESS → proxy, иначе fallback → nginx:8080
+  3x-ui:
+    image: ghcr.io/mhsanaei/3x-ui:latest
+    container_name: 3x-ui
+    restart: always
+    environment:
+      - TZ=${TIMEZONE:-UTC}
+    ports:
+      - "127.0.0.1:2053:2053"
+    volumes:
+      - 3x-ui-data:/etc/x-ui
+      - ./certbot/conf:/etc/letsencrypt:ro
+      - ./logs/3x-ui:/var/log/x-ui
+    networks:
+      - xray-net
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:2053/ > /dev/null 2>&1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+  # ── Автообновление сертификатов ──────────────────────────────────────────
+  certbot:
+    image: certbot/certbot:latest
+    container_name: certbot
+    restart: unless-stopped
+    volumes:
+      - ./certbot/conf:/etc/letsencrypt
+      - ./certbot/www:/var/www/certbot
+      - ./logs/certbot:/var/log/letsencrypt
+    entrypoint: >-
+      /bin/sh -c 'trap exit TERM;
+      while :; do
+        certbot renew
+          --webroot
+          --webroot-path=/var/www/certbot
+          --quiet;
+        sleep 12h & wait $${!};
+      done'
+    networks:
+      - xray-net
+
+  # ── Автообновление Docker-образов ────────────────────────────────────────
+  watchtower:
+    image: containrrr/watchtower:latest
+    container_name: watchtower
+    restart: always
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    command: --interval 86400 --cleanup
+    networks:
+      - xray-net
+
+networks:
+  xray-net:
+    driver: bridge
+
+volumes:
+  3x-ui-data:
