@@ -40,7 +40,7 @@ services:
     networks:
       - xray-net
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:8080/"]
+      test: ["CMD-SHELL", "wget -qO /dev/null http://127.0.0.1:8080/"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -63,7 +63,7 @@ services:
     networks:
       - xray-net
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://localhost:2053/ > /dev/null 2>&1"]
+      test: ["CMD-SHELL", "wget -qO /dev/null http://127.0.0.1:2053/"]
       interval: 30s
       timeout: 10s
       retries: 5
@@ -85,21 +85,11 @@ services:
           --webroot
           --webroot-path=/var/www/certbot
           --quiet;
-        sleep 12h & wait $${!};
+        sleep 12h & wait $$!;
       done'
     networks:
       - xray-net
 
-  # ── Автообновление Docker-образов ────────────────────────────────────────
-  watchtower:
-    image: containrrr/watchtower:latest
-    container_name: watchtower
-    restart: always
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
-    command: --interval 86400 --cleanup
-    networks:
-      - xray-net
 
 networks:
   xray-net:

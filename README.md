@@ -25,7 +25,7 @@
 - **XRay** (внутри 3x-ui) — терминирует TLS, обрабатывает VLESS-клиентов, некорректный трафик отдаёт nginx через fallback
 - **nginx** — отдаёт фейковый сайт по plain HTTP на внутреннем порту 8080 (снаружи недоступен), а также обслуживает порт 80 для ACME-challenge certbot
 - **certbot** — автоматически обновляет Let's Encrypt сертификат каждые 12 часов
-- **watchtower** — автоматически обновляет Docker-образы раз в сутки
+- **cron** — автоматически обновляет Docker-образы раз в неделю (воскресенье, 3:00)
 
 ## Требования
 
@@ -119,7 +119,7 @@ sudo ./setup-3xui.sh
 4. Получение SSL-сертификата через Let's Encrypt (webroot)
 5. Запуск Docker-контейнеров
 6. Проверка состояния
-7. Настройка cron для перезапуска XRay после обновления сертификата
+7. Настройка cron: ежедневный рестарт XRay (4:00) + еженедельное обновление образов (вс 3:00)
 8. Настройка исходящего прокси (если `PROXY_MODE ≠ off`)
 
 ## Настройка XRay через панель
@@ -204,6 +204,7 @@ PROXY_MODE=warp
     }
   ],
   "routing": {
+    "domainStrategy": "IPIfNonMatch",
     "rules": [
       {
         "type": "field",
@@ -219,7 +220,7 @@ PROXY_MODE=warp
 
 Проверить что трафик идёт через WARP:
 ```bash
-docker exec warp wget -qO- https://ifconfig.me
+docker exec warp curl -s https://ifconfig.me
 # Должен вернуть IP Cloudflare, а не IP вашего VPS
 ```
 
@@ -253,8 +254,10 @@ ufw status
 
 ```
 # /etc/cron.d/xray-cert-reload
-30 */12 * * * root docker restart 3x-ui
+0 4 * * * root docker restart 3x-ui
 ```
+
+> **Даунтайм**: перезапуск занимает ~30 секунд. Выбрано 4:00 ночи — минимум активных соединений. Certbot обновляет сертификат за 30 дней до истечения, ежесуточного рестарта достаточно.
 
 ## Полезные команды
 
@@ -271,13 +274,41 @@ docker compose logs -f sslh         # мультиплексор
 docker compose restart 3x-ui
 docker compose restart nginx
 
-# Обновить образы
+# Обновить образы вручную (автоматически — каждое воскресенье в 3:00 через cron)
 docker compose pull && docker compose up -d
 
 # С WARP
 docker compose -f docker-compose.yml -f docker-compose.warp.yml pull
 docker compose -f docker-compose.yml -f docker-compose.warp.yml up -d
 ```
+
+## Диагностика логов XRay
+
+### "connection forcibly closed by remote host" / "connection aborted"
+
+Эти ошибки в логах XRay **нормальны** и не требуют исправления. Удалённый сервер (Telegram, Microsoft CDN и др.) закрывает неактивное TCP-соединение, отправляя RST. XRay логирует это как ошибку, но это штатное поведение.
+
+### YouTube / Telegram / Instagram не грузятся несколько секунд
+
+**Симптом**: сайты периодически не открываются, в логах клиентского XRay видны ошибки `outbound/direct` для зарубежных IP.
+
+**Причина**: клиентский роутинг отправляет часть трафика напрямую (`direct`), минуя прокси. ISP блокирует эти IP.
+
+**Решение** — в настройках клиента (v2rayN, Hiddify, Nekoray и др.) проверить режим роутинга:
+- Убедитесь что для Telegram, Instagram, YouTube выбран outbound `proxy`, а не `direct`
+- Или переключитесь на режим **«весь трафик через proxy»** и добавьте исключение только для локальных адресов
+
+Пример правил для клиента (добавить в proxy-список):
+```
+geosite:youtube
+geosite:instagram
+geosite:telegram
+geoip:telegram
+```
+
+### "open connection ... using outbound/vless[proxy]: connection attempt failed"
+
+VPS-прокси временно недоступен или перегружен. Если происходит часто — проверьте стабильность exit VPS.
 
 ## Troubleshooting
 

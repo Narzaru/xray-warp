@@ -85,7 +85,7 @@ command -v envsubst &>/dev/null || die "envsubst не найден → sudo apt-
 
 # Поддержка docker-compose v1 (docker-compose) и v2 (docker compose).
 # v2 проверяется первым: v1.29.2 несовместим с Docker Engine 25+ (KeyError: ContainerConfig).
-if docker compose version &>/dev/null 2>&1; then
+if docker compose version &>/dev/null; then
     DC=(docker compose)
     _dc_ver=$(docker compose version --short 2>/dev/null)
 elif command -v docker-compose &>/dev/null; then
@@ -262,10 +262,27 @@ done
 step 7 "Настройка перезапуска XRay после renewal"
 
 CRON_FILE="/etc/cron.d/xray-cert-reload"
+_PROJECT_DIR="$(pwd)"
+_DC_STR="${DC[*]}"
+# При PROXY_MODE=warp в cron нужно передавать оба compose-файла,
+# иначе --remove-orphans удалит warp-контейнер как "чужой".
+if [ "$PROXY_MODE" = "warp" ]; then
+    _DC_UP="${_DC_STR} -f docker-compose.yml -f docker-compose.warp.yml"
+else
+    _DC_UP="${_DC_STR}"
+fi
 cat > "$CRON_FILE" << CRON
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
+
 # XRay читает сертификат при старте — перезапускаем контейнер после renewal.
-# Запускается каждые 12 часов с небольшим смещением от certbot (каждые ~12ч).
-30 */12 * * * root docker restart 3x-ui >> /var/log/xray-cert-reload.log 2>&1
+# Certbot обновляет сертификат за 30 дней до истечения; ежесуточного рестарта достаточно.
+# Запуск в 4:00 ночи — минимум активных соединений, ~30 сек даунтайма.
+0 4 * * * root docker restart 3x-ui >> /var/log/xray-cert-reload.log 2>&1
+
+# Автообновление Docker-образов
+# Запуск раз в неделю в воскресенье в 3:00 ночи.
+0 3 * * 0 root cd "${_PROJECT_DIR}" && ${_DC_UP} pull --quiet && ${_DC_UP} up -d --remove-orphans >> /var/log/xray-image-update.log 2>&1
 CRON
 chmod 644 "$CRON_FILE"
 ok "Создан $CRON_FILE"

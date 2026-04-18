@@ -16,4 +16,15 @@ services:
       - net.ipv4.conf.all.src_valid_mark=1
     networks:
       - xray-net
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsSm 10 --socks5-hostname 127.0.0.1:1080 https://cloudflare.com/cdn-cgi/trace | grep -qE 'warp=(on|plus)'"]
+      interval: 10s
+      timeout: 15s
+      retries: 18
+      start_period: 30s
+
+  3x-ui:
+    depends_on:
+      warp:
+        condition: service_healthy
 
