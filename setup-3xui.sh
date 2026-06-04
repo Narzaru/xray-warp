@@ -134,6 +134,29 @@ step 2 "Создание директорий"
 mkdir -p certbot/{conf,www} \
          logs/{nginx,3x-ui,certbot}
 
+# Ограничение логов Docker глобально (покрывает временные контейнеры certbot/nginx-init)
+_daemon_cfg=/etc/docker/daemon.json
+if [ ! -f "$_daemon_cfg" ] || ! grep -q '"max-size"' "$_daemon_cfg"; then
+    _tmp=$(mktemp)
+    if [ -f "$_daemon_cfg" ] && [ -s "$_daemon_cfg" ]; then
+        # Влить в существующий JSON
+        python3 -c "
+import json, sys
+d = json.load(open('$_daemon_cfg'))
+d.setdefault('log-driver','json-file')
+d.setdefault('log-opts',{}).update({'max-size':'10m','max-file':'3'})
+print(json.dumps(d, indent=2))
+" > "$_tmp"
+    else
+        echo '{"log-driver":"json-file","log-opts":{"max-size":"10m","max-file":"3"}}' > "$_tmp"
+    fi
+    mv "$_tmp" "$_daemon_cfg"
+    systemctl reload docker 2>/dev/null || true
+    ok "Docker log rotation настроен (10m × 3 файла)"
+else
+    ok "Docker log rotation уже настроен"
+fi
+
 chmod 700 certbot/conf
 chmod 755 certbot/www logs logs/nginx logs/3x-ui logs/certbot
 
@@ -167,11 +190,22 @@ if [ -f "$CERT" ]; then
 else
     # Запустить временный nginx только с HTTP (без SSL-блоков — сертификата ещё нет)
     echo "  Запуск временного nginx для webroot..."
-    docker run -d --rm --name nginx-certbot-init \
+    docker stop nginx-certbot-init 2>/dev/null || true
+    if ! docker run -d --rm --name nginx-certbot-init \
         -p 80:80 \
         -v "$(pwd)/nginx-init.conf:/etc/nginx/conf.d/default.conf:ro" \
         -v "$(pwd)/certbot/www:/var/www/certbot" \
-        nginx:alpine >/dev/null
+        nginx:alpine; then
+        die "Не удалось запустить nginx на порту 80. Проверьте: ss -tlnp | grep :80"
+    fi
+
+    # Подождать, пока nginx полностью поднимется (bash /dev/tcp — без внешних зависимостей)
+    _retries=10
+    until bash -c 'echo >/dev/tcp/localhost/80' 2>/dev/null || [ $_retries -eq 0 ]; do
+        sleep 1; _retries=$((_retries - 1))
+    done
+    [ $_retries -gt 0 ] || { docker stop nginx-certbot-init 2>/dev/null || true; die "nginx не ответил на порту 80 за 10 секунд. Проверьте: ss -tlnp | grep :80"; }
+    ok "nginx слушает порт 80"
 
     echo "  Запрос сертификата для: ${DOMAIN}"
 
@@ -357,18 +391,23 @@ echo -e "  Логин: ${YELLOW}admin${NC}   Пароль: ${YELLOW}admin${NC}  
 
 echo ""
 echo -e "${GREEN}Настройка XRay Inbound в панели:${NC}"
-echo "  Protocol:    VLESS"
-echo "  Port:        10000"
-echo "  Transmission: TCP (RAW)"
-echo "  TLS:         включить"
-echo "  uTLS:        none"
-echo "  ALPN:        http/1.1  ← убрать h2, оставить только это"
-echo "  Certificate: /etc/letsencrypt/live/${DOMAIN}/fullchain.pem"
-echo "  Key:         /etc/letsencrypt/live/${DOMAIN}/privkey.pem"
-echo "  SNI клиента: ${DOMAIN}"
+echo "  Protocol:     VLESS"
+echo "  Port:         10000"
+echo "  Certificate:  /etc/letsencrypt/live/${DOMAIN}/fullchain.pem"
+echo "  Key:          /etc/letsencrypt/live/${DOMAIN}/privkey.pem"
 echo ""
-echo -e "${GREEN}Fallback (чтобы фейковый сайт открывался на прямой HTTPS):${NC}"
-echo '  В поле Fallbacks добавить: [{"dest":"nginx:8080","xVer":0}]'
+echo -e "${GREEN}Вариант A — xHTTP (рекомендуется, обходит DPI):${NC}"
+echo "  Transmission: xHTTP"
+echo "  Path:         /game  (или любой другой)"
+echo "  Host:         ${DOMAIN}"
+echo "  TLS:          включить,  uTLS: firefox,  ALPN: h2, http/1.1"
+echo "  SNI клиента:  ${DOMAIN}"
+echo ""
+echo -e "${GREEN}Вариант B — TCP/RAW (проще, но хуже обходит блокировки):${NC}"
+echo "  Transmission: TCP (RAW)"
+echo "  TLS:          включить,  uTLS: none,  ALPN: http/1.1"
+echo "  SNI клиента:  ${DOMAIN}"
+echo "  Fallback:     [{\"dest\":\"nginx:8080\",\"xVer\":0}]"
 
 if [ "$PROXY_MODE" != "off" ]; then
     echo ""

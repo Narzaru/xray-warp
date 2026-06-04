@@ -84,10 +84,15 @@ apt-get install -y docker.io docker-compose-v2 gettext-base
 ### 1. Скопировать файлы на сервер
 
 ```bash
-scp -r ./x-ui user@YOUR_SERVER_IP:/opt/x-ui
+# С локальной машины — из директории проекта
+scp -r . user@YOUR_SERVER_IP:/opt/x-ui
 ssh user@YOUR_SERVER_IP
 cd /opt/x-ui
 ```
+
+> **Важно**: скрипт должен запускаться из директории проекта, где лежат `config/`, `docker-compose.yml` и т.д. Если запустить из другой директории — конфиги не найдутся и монтирование в Docker сломается.
+
+> **Windows**: если файлы скопированы с Windows-машины, а не через `git clone`, скрипт может содержать CRLF-переносы строк. Исправить: `sed -i 's/\r//' setup-3xui.sh`
 
 ### 2. Настроить переменные
 
@@ -127,7 +132,11 @@ sudo ./setup-3xui.sh
 После установки панель доступна **только через SSH-туннель** (порт 2053 не пробрасывается в интернет):
 
 ```bash
+# После полной настройки — через порт 443 (sslh мультиплексирует SSH и TLS)
 ssh -L 2053:localhost:2053 -p 443 user@yourdomain.com
+
+# При первичной настройке (если sslh ещё не работает) — через стандартный SSH-порт
+ssh -L 2053:localhost:2053 user@yourdomain.com
 ```
 
 Открыть в браузере: `http://localhost:2053`  
@@ -135,28 +144,42 @@ ssh -L 2053:localhost:2053 -p 443 user@yourdomain.com
 
 ### Добавить VLESS Inbound
 
-`Inbounds → Add Inbound`:
+`Inbounds → Add Inbound`. Общие параметры для обоих вариантов:
 
 | Поле | Значение |
 |---|---|
 | Protocol | VLESS |
 | Port | 10000 |
-| Transmission | TCP (RAW) |
 | Security | TLS |
-| SNI | yourdomain.com |
-| uTLS | none |
-| ALPN | `http/1.1` (убрать h2, оставить только это) |
 | Certificate File | `/etc/letsencrypt/live/yourdomain.com/fullchain.pem` |
 | Key File | `/etc/letsencrypt/live/yourdomain.com/privkey.pem` |
 
-В секции **Fallbacks** добавить:
+#### Вариант A — xHTTP (рекомендуется, лучше обходит DPI)
+
+| Поле | Значение |
+|---|---|
+| Transmission | xHTTP |
+| Path | `/game` (или любой другой) |
+| Host | `yourdomain.com` |
+| uTLS | `firefox` (или `chrome`) |
+| ALPN | `h2`, `http/1.1` |
+| SNI клиента | `yourdomain.com` |
+
+#### Вариант B — TCP/RAW (проще)
+
+| Поле | Значение |
+|---|---|
+| Transmission | TCP (RAW) |
+| uTLS | none |
+| ALPN | `http/1.1` (убрать h2) |
+| SNI клиента | `yourdomain.com` |
+
+В секции **Fallbacks** добавить (только для TCP/RAW — при xHTTP fallback не нужен):
 
 | Поле | Значение |
 |---|---|
 | Dest | `nginx:8080` |
 | xVer | `0` |
-
-Или вставить JSON напрямую: `[{"dest":"nginx:8080","xVer":0}]`
 
 Сохранить → **Restart XRay**.
 
@@ -280,7 +303,12 @@ docker compose pull && docker compose up -d
 # С WARP
 docker compose -f docker-compose.yml -f docker-compose.warp.yml pull
 docker compose -f docker-compose.yml -f docker-compose.warp.yml up -d
+
+# Сколько места занимают логи Docker
+du -sh /var/lib/docker/containers/*/
 ```
+
+> **Ротация логов**: скрипт автоматически настраивает `/etc/docker/daemon.json` (глобально, 10 МБ × 3 файла) и `logging:` в docker-compose.yml для каждого сервиса. Если место всё равно заканчивается — проверьте логи в `./logs/` (nginx, 3x-ui, certbot монтируют их туда).
 
 ## Диагностика логов XRay
 
@@ -312,27 +340,142 @@ VPS-прокси временно недоступен или перегруже
 
 ## Troubleshooting
 
-**Certbot не может получить сертификат**
-- Проверьте DNS: `dig +short yourdomain.com` должен вернуть IP сервера
-- Проверьте firewall: `ufw allow 80/tcp && ufw allow 443/tcp`
-- Порт 80 не занят: `ss -tlnp | grep :80`
+### Certbot: `Connection refused` при получении сертификата
 
-**Клиент не подключается**
-- Убедитесь что в клиенте указан порт `443`, а не `10000`
-- Проверьте что XRay запущен: `docker compose logs 3x-ui | tail -20`
-- Проверьте что inbound добавлен в панели с Fallback `nginx:8080`
+Let's Encrypt не может скачать ACME-challenge с вашего сервера. Три причины:
 
-**Фейковый сайт не открывается**
-- Должен открываться `https://yourdomain.com` — XRay принимает соединение, не распознаёт VLESS и отдаёт через fallback в nginx
-- Проверьте что nginx запущен: `docker compose logs nginx`
+**1. Фаервол облачного провайдера** (самая частая причина)
 
-**WARP не работает**
+Большинство провайдеров (Hetzner, DigitalOcean, Serverspace, Timeweb и др.) имеют **отдельный фаервол на уровне панели управления**, независимый от UFW. Он может блокировать порт 80 даже если UFW разрешает его.
+
+→ Войдите в панель управления вашего VPS и откройте входящие TCP-порты **80** и **443**.
+
+**2. Порт 80 занят другим процессом**
+
+```bash
+ss -tlnp | grep :80
+```
+Если что-то уже слушает — остановите перед запуском скрипта.
+
+**3. DNS ещё не обновился**
+
+```bash
+dig +short yourdomain.com   # должен вернуть IP этого сервера
+```
+
+---
+
+### nginx-контейнер падает сразу после запуска
+
+Симптом: `docker run` возвращает ID контейнера, но `docker ps` пустой.
+
+Запустите без `--rm` чтобы увидеть логи:
+```bash
+docker run -d --name nginx-debug \
+    -p 80:80 \
+    -v "$(pwd)/nginx-init.conf:/etc/nginx/conf.d/default.conf:ro" \
+    nginx:alpine
+docker logs nginx-debug
+docker rm nginx-debug
+```
+
+**Причина A: IPv6 не поддерживается ядром**
+
+Ошибка: `socket() [::]:80 failed (97: Address family not supported by protocol)`
+
+В файлах конфига уже убраны IPv6-директивы. Если проблема осталась — убедитесь что на сервере лежит актуальная версия файлов (не старая копия с `listen [::]:80`).
+
+**Причина B: `nginx-init.conf` — директория вместо файла**
+
+Ошибка: `mount ... not a directory: Are you trying to mount a directory onto a file?`
+
+Docker создал папку вместо монтирования файла — значит файл не существовал в момент запуска. Скрипт не был запущен из директории проекта:
+```bash
+rm -rf nginx-init.conf   # удалить ошибочно созданную директорию
+# убедиться что вы в директории проекта:
+ls config/nginx/nginx-init.conf
+```
+
+---
+
+### Скрипт: `$'\r': command not found` / `invalid option name`
+
+Windows-переносы строк (CRLF) в shell-скрипте. Исправить:
+```bash
+sed -i 's/\r//' setup-3xui.sh
+```
+В репозитории уже добавлен `.gitattributes`, который автоматически выдаёт LF при `git clone`. Проблема возникает только при копировании файлов через `scp` с Windows без git.
+
+---
+
+### WARP-контейнер: ошибка sysctl IPv6
+
+Ошибка: `open sysctl net.ipv6.conf.all.disable_ipv6 file: unsafe procfs detected: no such file or directory`
+
+Ядро сервера собрано без поддержки IPv6 — соответствующий путь в `/proc/sys/net/ipv6` отсутствует. В `docker-compose.warp.yml` директива уже убрана. Если проблема осталась — убедитесь что на сервере актуальный файл.
+
+---
+
+### XRay не запускается: `neither outboundTag nor balancerTag is specified`
+
+Ошибка в routing-конфиге XRay. Чаще всего возникает при переносе конфига со старого сервера.
+
+Проверьте конфиг:
+```bash
+docker exec 3x-ui cat /usr/local/x-ui/bin/config.json
+```
+
+Два частых виновника:
+
+**1. Нестандартное поле `finalRules` в outbound `direct`**
+
+Удалите `finalRules` из настроек freedom-outbound, оставив только:
+```json
+{
+  "tag": "direct",
+  "protocol": "freedom",
+  "settings": { "domainStrategy": "AsIs" }
+}
+```
+
+**2. Пустое catch-all правило роутинга**
+
+Правило `{"type": "field", "outboundTag": "direct"}` без единого условия отвергается новыми версиями XRay. Удалите его в панели: **Settings → Xray Configs → Routing**.
+
+---
+
+### Клиент не подключается
+
+- Порт в клиенте должен быть **443**, а не 10000 (10000 — внутренний, снаружи слушает sslh)
+- SNI клиента должен совпадать с доменом в сертификате (`yourdomain.com`, не другой)
+- Проверьте что XRay запущен: `docker compose logs 3x-ui --tail 20`
+- Проверьте sslh: `docker compose logs sslh --tail 10`
+
+---
+
+### Фейковый сайт не открывается
+
+`https://yourdomain.com` должен открываться при TCP/RAW transport — XRay не распознаёт обычный HTTPS и делает fallback в nginx:8080.
+
+При xHTTP-transport фейковый сайт через браузер не откроется (XRay ожидает конкретный path и заголовки). Это нормально.
+
+```bash
+docker compose logs nginx --tail 20
+```
+
+---
+
+### WARP не работает
+
 ```bash
 docker logs warp --tail 30
 docker exec 3x-ui curl -x socks5://warp:1080 https://ifconfig.me
+# Должен вернуть IP Cloudflare, не IP вашего VPS
 ```
 
-**Не могу подключиться по SSH после `ufw enable`**
+---
+
+### Не могу подключиться по SSH после `ufw enable`
 
 UFW был выключен во время установки — правила не применились. Добавьте вручную (замените `22` на ваш `SSH_PORT` из `.env`):
 ```bash
