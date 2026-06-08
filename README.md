@@ -408,11 +408,19 @@ sed -i 's/\r//' setup-3xui.sh
 
 ---
 
-### WARP-контейнер: ошибка sysctl IPv6
+### WARP-контейнер: ошибка sysctl IPv6 (старый образ caomingjun/warp)
 
 Ошибка: `open sysctl net.ipv6.conf.all.disable_ipv6 file: unsafe procfs detected: no such file or directory`
 
-Ядро сервера собрано без поддержки IPv6 — соответствующий путь в `/proc/sys/net/ipv6` отсутствует. В `docker-compose.warp.yml` директива уже убрана. Если проблема осталась — убедитесь что на сервере актуальный файл.
+Возникала с прежним образом `caomingjun/warp`, если ядро сервера собрано без поддержки IPv6 (путь `/proc/sys/net/ipv6` отсутствует). С переходом на MicroWARP (`ghcr.io/ccbkkb/microwarp`) эта проблема не актуальна — соответствующая директива в `docker-compose.warp.yml` отсутствует.
+
+---
+
+### WARP-контейнер: не хватает прав на загрузку модуля ядра
+
+Ошибка вида `Operation not permitted` при инициализации WireGuard внутри контейнера `warp`.
+
+MicroWARP запускает WireGuard через модуль ядра и требует `cap_add: SYS_MODULE` (уже добавлено в `docker-compose.warp.yml`). Если ядро сервера собрано с `wireguard` как встроенным модулем (не загружаемым), хватит и одного `NET_ADMIN` — `SYS_MODULE` можно убрать. Проверить: `lsmod | grep wireguard` и `modinfo wireguard`.
 
 ---
 
