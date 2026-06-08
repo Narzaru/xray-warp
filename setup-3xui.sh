@@ -106,7 +106,7 @@ else
 fi
 
 ok "docker $(docker --version | awk '{print $3}' | tr -d ',')"
-ok "${DC[*]} ${_dc_ver}"
+ok "$(IFS=' '; echo "${DC[*]}") ${_dc_ver}"
 ok "envsubst $(envsubst --version 2>&1 | head -1)"
 
 # UFW: прописываем правила независимо от того, включён UFW или нет.
@@ -297,7 +297,7 @@ step 7 "Настройка перезапуска XRay после renewal"
 
 CRON_FILE="/etc/cron.d/xray-cert-reload"
 _PROJECT_DIR="$(pwd)"
-_DC_STR="${DC[*]}"
+_DC_STR=$(IFS=' '; echo "${DC[*]}")
 # При PROXY_MODE=warp в cron нужно передавать оба compose-файла,
 # иначе --remove-orphans удалит warp-контейнер как "чужой".
 if [ "$PROXY_MODE" = "warp" ]; then
@@ -420,7 +420,7 @@ if [ "$PROXY_MODE" != "off" ]; then
 fi
 
 echo ""
-_dc="${DC[*]}"
+_dc=$(IFS=' '; echo "${DC[*]}")
 echo -e "${GREEN}Полезные команды:${NC}"
 echo "  ${_dc} ps                       # состояние контейнеров"
 echo "  ${_dc} logs -f 3x-ui            # логи панели / XRay"
