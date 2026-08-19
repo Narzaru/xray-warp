@@ -197,23 +197,19 @@ ok "nginx-init.conf (временный, для certbot)"
 if [ "$HYSTERIA" = "on" ]; then
     [ -f config/hysteria/config.yaml ] || die "Не найден config/hysteria/config.yaml"
 
-    # Пароли генерируются один раз и дописываются в .env, чтобы переустановка
+    # Пароль генерируется один раз и дописывается в .env, чтобы переустановка
     # не сбрасывала доступ у уже настроенных клиентов.
-    for _u in YAROSLAV MAMA PAPA; do
-        _var="HYSTERIA_PASS_${_u}"
-        if [ -z "${!_var:-}" ]; then
-            _pass=$(head -c 24 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 28)
-            printf '%s=%s\n' "$_var" "$_pass" >> .env
-            export "$_var=$_pass"
-            ok "Сгенерирован ${_var}"
-        fi
-    done
-    export HYSTERIA_PASS_YAROSLAV HYSTERIA_PASS_MAMA HYSTERIA_PASS_PAPA
+    if [ -z "${HYSTERIA_PASSWORD:-}" ]; then
+        HYSTERIA_PASSWORD=$(head -c 24 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 28)
+        printf 'HYSTERIA_PASSWORD=%s\n' "$HYSTERIA_PASSWORD" >> .env
+        ok "Сгенерирован HYSTERIA_PASSWORD"
+    fi
+    export HYSTERIA_PASSWORD
 
-    envsubst '${DOMAIN} ${HYSTERIA_PASS_YAROSLAV} ${HYSTERIA_PASS_MAMA} ${HYSTERIA_PASS_PAPA}' \
+    envsubst '${DOMAIN} ${HYSTERIA_PASSWORD}' \
         < config/hysteria/config.yaml > config/hysteria/config.generated.yaml
     chmod 600 config/hysteria/config.generated.yaml
-    ok "config/hysteria/config.generated.yaml (пароли из .env)"
+    ok "config/hysteria/config.generated.yaml (пароль из .env)"
 fi
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -463,11 +459,8 @@ if [ "$HYSTERIA" = "on" ]; then
     echo -e "${GREEN}Hysteria2 (QUIC/UDP на :443/udp):${NC}"
     echo -e "  ${YELLOW}v2rayNG этот протокол не поддерживает — нужен Hiddify, NekoBox или sing-box.${NC}"
     echo ""
-    echo "  Ссылки для импорта:"
-    for _u in yaroslav mama papa; do
-        _var="HYSTERIA_PASS_$(echo "$_u" | tr '[:lower:]' '[:upper:]')"
-        echo "    ${_u}:  hy2://${_u}:${!_var}@${DOMAIN}:443/?sni=${DOMAIN}#${DOMAIN}-${_u}"
-    done
+    echo "  Ссылка для импорта (общая на всех клиентов):"
+    echo "    hy2://${HYSTERIA_PASSWORD}@${DOMAIN}:443/?sni=${DOMAIN}#${DOMAIN}-hy2"
     echo ""
     echo -e "  ${YELLOW}В клиенте задайте полосу (Upload/Download Mbps) чуть ниже реальной${NC}"
     echo -e "  ${YELLOW}скорости канала — иначе не включится Brutal и смысл транспорта теряется.${NC}"

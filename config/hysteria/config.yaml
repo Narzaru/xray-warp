@@ -12,13 +12,9 @@ tls:
   key: /etc/letsencrypt/live/${DOMAIN}/privkey.pem
 
 auth:
-  # Многопользовательский режим: у каждого свой логин и пароль,
-  # любого можно отозвать отдельно, не трогая остальных.
-  type: userpass
-  userpass:
-    yaroslav: ${HYSTERIA_PASS_YAROSLAV}
-    mama: ${HYSTERIA_PASS_MAMA}
-    papa: ${HYSTERIA_PASS_PAPA}
+  # Один общий пароль на всех клиентов.
+  type: password
+  password: ${HYSTERIA_PASSWORD}
 
 # Маскировка: на посторонние запросы отдаём фейковый сайт с nginx.
 # Пробинг снаружи видит обычный веб-сервер, а не прокси.
