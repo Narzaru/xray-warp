@@ -3,17 +3,24 @@
 #
 # Использование:
 #   docker-compose -f docker-compose.yml -f docker-compose.warp.yml up -d
+#
+# Образ: MicroWARP (https://github.com/ccbkkb/MicroWARP) — лёгкая замена
+# официальному демону warp-svc (используется в caomingjun/warp), который
+# страдает от утечки памяти (~3 МБ/час, см. диагностику). MicroWARP поднимает
+# тот же WireGuard-туннель Cloudflare WARP средствами ядра, без демона.
 
 services:
   warp:
-    image: caomingjun/warp:latest
+    image: ghcr.io/ccbkkb/microwarp:latest
     container_name: warp
     restart: always
     cap_add:
       - NET_ADMIN
+      - SYS_MODULE
     sysctls:
-      - net.ipv6.conf.all.disable_ipv6=0
       - net.ipv4.conf.all.src_valid_mark=1
+    volumes:
+      - warp-data:/etc/wireguard
     networks:
       - xray-net
     healthcheck:
@@ -27,4 +34,7 @@ services:
     depends_on:
       warp:
         condition: service_healthy
+
+volumes:
+  warp-data:
 

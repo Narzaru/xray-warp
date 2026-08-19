@@ -1,0 +1,81 @@
+# ══════════════════════════════════════════════════════════════════════════
+# Caddy — TLS-фронт вместо nginx
+#
+# Причина замены: nginx проксирует по HTTP/1.1 последовательно и не держит
+# дуплекс внутри одного запроса. Из-за этого у XHTTP выживал только режим
+# packet-up, а он открывает поток коротких соединений — на мобильных сетях
+# за CGNAT это выжигает квоту трансляций, и SYN-ACK перестаёт доходить.
+# Caddy проксирует в XRay по h2c, где дуплекс штатный, поэтому становятся
+# доступны stream-up и stream-one — одно долгоживущее соединение вместо сотен.
+# ══════════════════════════════════════════════════════════════════════════
+
+{
+    # Сертификаты выдаёт certbot, автоматика Caddy здесь не нужна:
+    # порт 443 занят sslh, ACME-челлендж Caddy провести не сможет.
+    auto_https off
+
+    # Admin API нужен для `caddy reload` — им cron перечитывает сертификат
+    # после обновления certbot'ом, без разрыва соединений. Слушает только
+    # loopback внутри контейнера и на хост не публикуется.
+    admin localhost:2019
+
+    log {
+        output stdout
+        format console
+        level INFO
+    }
+}
+
+# ── Порт 80: ACME challenge + редирект на HTTPS ───────────────────────────
+:80 {
+    handle /.well-known/acme-challenge/* {
+        root * /var/www/certbot
+        file_server
+    }
+
+    handle {
+        redir https://{host}{uri} permanent
+    }
+}
+
+# ── Порт 8080: plain HTTP ─────────────────────────────────────────────────
+# Фейковый сайт без TLS. Не публикуется на хост, доступен только из
+# Docker-сети. Используется healthcheck'ом и остаётся точкой fallback,
+# если терминацию TLS когда-нибудь вернут в XRay.
+:8080 {
+    root * /var/www/html
+    file_server
+}
+
+# ── Порт 8443: TLS-фронт ──────────────────────────────────────────────────
+# sslh направляет сюда весь TLS с 443. Посторонний запрос видит настоящий
+# сайт, а /game уходит в XRay, который работает по xhttp уже без TLS
+# (в панели inbound должен быть security: none).
+:8443 {
+    tls /etc/letsencrypt/live/${DOMAIN}/fullchain.pem /etc/letsencrypt/live/${DOMAIN}/privkey.pem
+
+    # xhttp-эндпоинт XRay.
+    #   h2c            — HTTP/2 без TLS до XRay: даёт полный дуплекс,
+    #                    ради которого Caddy сюда и поставлен
+    #   flush_interval — -1 отключает буферизацию, транспорт потоковый
+    #   X-Forwarded-*  — убраны: за sslh реальный IP клиента всё равно
+    #                    потерян, а XRay на каждый такой заголовок пишет
+    #                    предупреждение в лог
+    handle /game* {
+        reverse_proxy h2c://3x-ui:10000 {
+            flush_interval -1
+            header_up -X-Forwarded-For
+            header_up -X-Forwarded-Proto
+            header_up -X-Forwarded-Host
+        }
+    }
+
+    handle {
+        root * /var/www/html
+        file_server
+
+        header /*.{jpg,jpeg,png,gif,css,js,ico,woff,woff2} {
+            Cache-Control "public, max-age=2592000, immutable"
+        }
+    }
+}

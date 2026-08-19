@@ -2,7 +2,7 @@ services:
 
   # ── Мультиплексор порта 443 ──────────────────────────────────────────────
   # SSH  → host sshd
-  # TLS  → 3x-ui XRay :10000 (XRay сам терминирует TLS и делает fallback)
+  # TLS  → caddy :8443 (Caddy терминирует TLS и проксирует /game в XRay)
   sslh:
     image: ghcr.io/yrutschle/sslh:latest
     container_name: sslh
@@ -15,28 +15,52 @@ services:
       - --foreground
       - --listen=0.0.0.0:443
       - --ssh=host.docker.internal:${SSH_PORT:-22}
-      - --tls=3x-ui:10000
-      - --anyprot=3x-ui:10000
+      - --tls=caddy:8443
+      - --anyprot=caddy:8443
+    # Congestion control живёт в сетевом namespace контейнера, а не на хосте:
+    # без этого сокеты работают на cubic, который на канале с потерями режет
+    # окно вдвое на каждую потерю. Внешнее TCP-соединение с клиентом
+    # терминирует sslh, поэтому здесь это критично.
+    sysctls:
+      - net.ipv4.tcp_congestion_control=bbr
+      - net.ipv4.tcp_rmem=4096 131072 8388608
+      - net.ipv4.tcp_wmem=4096 16384 8388608
     networks:
       - xray-net
     depends_on:
-      3x-ui:
+      caddy:
         condition: service_healthy
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
 
-  # ── Фейковый сайт ────────────────────────────────────────────────────────
+  # ── TLS-фронт и фейковый сайт ────────────────────────────────────────────
   # Порт 80  : ACME challenge (certbot) + редирект на 443
-  # Порт 8080: plain HTTP — XRay fallback (TLS уже снят в XRay)
-  nginx:
-    image: nginx:alpine
-    container_name: nginx
+  # Порт 8080: plain HTTP — фейковый сайт без TLS (только внутри Docker-сети)
+  # Порт 8443: TLS от sslh; /game проксируется в XRay по h2c
+  #
+  # Caddy вместо nginx — ради дуплексного проксирования: без него у XHTTP
+  # работает только packet-up, который на мобильных сетях за CGNAT душит сам
+  # себя потоком коротких соединений.
+  caddy:
+    image: caddy:2-alpine
+    container_name: caddy
     restart: always
     ports:
       - "80:80"
     volumes:
-      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./certbot/conf:/etc/letsencrypt:ro
       - ./html:/var/www/html:ro
       - ./certbot/www:/var/www/certbot:ro
-      - ./logs/nginx:/var/log/nginx
+      - caddy-data:/data
+      - caddy-config:/config
+    sysctls:
+      - net.ipv4.tcp_congestion_control=bbr
+      - net.ipv4.tcp_rmem=4096 131072 8388608
+      - net.ipv4.tcp_wmem=4096 16384 8388608
     networks:
       - xray-net
     healthcheck:
@@ -44,10 +68,15 @@ services:
       interval: 30s
       timeout: 10s
       retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
 
   # ── Панель управления + встроенный XRay ──────────────────────────────────
   # Порт 2053 : веб-панель (только через SSH-туннель: ssh -L 2053:localhost:2053 -p 443 user@server)
-  # Порт 10000: XRay inbound — принимает TLS, VLESS → proxy, иначе fallback → nginx:8080
+  # Порт 10000: XRay inbound — xhttp без TLS, TLS снимает Caddy на :8443
   3x-ui:
     image: ghcr.io/mhsanaei/3x-ui:latest
     container_name: 3x-ui
@@ -60,6 +89,10 @@ services:
       - 3x-ui-data:/etc/x-ui
       - ./certbot/conf:/etc/letsencrypt:ro
       - ./logs/3x-ui:/var/log/x-ui
+    sysctls:
+      - net.ipv4.tcp_congestion_control=bbr
+      - net.ipv4.tcp_rmem=4096 131072 8388608
+      - net.ipv4.tcp_wmem=4096 16384 8388608
     networks:
       - xray-net
     healthcheck:
@@ -68,6 +101,11 @@ services:
       timeout: 10s
       retries: 5
       start_period: 60s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
 
   # ── Автообновление сертификатов ──────────────────────────────────────────
   certbot:
@@ -89,6 +127,11 @@ services:
       done'
     networks:
       - xray-net
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "2"
 
 
 networks:
@@ -97,3 +140,5 @@ networks:
 
 volumes:
   3x-ui-data:
+  caddy-data:
+  caddy-config:

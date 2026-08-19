@@ -1,0 +1,31 @@
+# Подключается поверх docker-compose.yml для транспорта Hysteria2 (QUIC/UDP).
+#
+# Использование:
+#   docker-compose -f docker-compose.yml -f docker-compose.hysteria.yml up -d
+#
+# Зачем: xhttp работает поверх TCP, а на мобильных каналах с потерями пакетов
+# TCP обрушивает окно перегрузки и скорость падает в разы. Hysteria2 использует
+# QUIC с алгоритмом Brutal — держит полосу при потерях вместо отступления.
+#
+# Изоляция: свой протокол на UDP 443, свой пароль, отдельный контейнер.
+# 3x-ui, XRay, sslh и конфиги существующих клиентов не затрагиваются.
+
+services:
+  hysteria:
+    image: tobyxdd/hysteria:v2
+    container_name: hysteria
+    restart: always
+    command: server -c /etc/hysteria/config.yaml
+    ports:
+      # UDP 443. TCP 443 занят sslh — это независимые порты, конфликта нет.
+      - "443:443/udp"
+    volumes:
+      - ./config/hysteria/config.generated.yaml:/etc/hysteria/config.yaml:ro
+      - ./certbot/conf:/etc/letsencrypt:ro
+    networks:
+      - xray-net
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

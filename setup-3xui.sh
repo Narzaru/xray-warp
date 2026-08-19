@@ -1,12 +1,14 @@
 #!/bin/bash
-# setup-3xui.sh — установка 3x-ui + XRay + Nginx + sslh в Docker
+# setup-3xui.sh — установка 3x-ui + XRay + Caddy + sslh в Docker
 #
 # Архитектура порта 443:
-#   Интернет :443 → [sslh]
-#                     ├── SSH  → host sshd (порт из .env)
-#                     └── TLS  → [3x-ui XRay :10000]
-#                                  ├── VLESS             → proxy out
-#                                  └── fallback (HTTP)   → nginx :8080 (фейковый сайт)
+#   Интернет :443/tcp → [sslh]
+#                         ├── SSH → host sshd (порт из .env)
+#                         └── TLS → [caddy :8443]  ← TLS терминирует Caddy
+#                                      ├── /game          → [XRay :10000] xhttp без TLS
+#                                      └── всё остальное  → фейковый сайт
+#
+#   Интернет :443/udp → [hysteria]  (опционально, HYSTERIA=on в .env)
 #
 # Зависимости: docker, docker-compose, envsubst (пакет gettext-base)
 #
@@ -66,13 +68,28 @@ _sys_tz=$(timedatectl show --property=Timezone --value 2>/dev/null \
 TIMEZONE="${TIMEZONE:-${_sys_tz}}"
 SSH_PORT="${SSH_PORT:-22}"
 PROXY_MODE="${PROXY_MODE:-off}"
-export TIMEZONE SSH_PORT PROXY_MODE
+export DOMAIN TIMEZONE SSH_PORT PROXY_MODE
+
+# Hysteria2 — опциональный транспорт QUIC/UDP (docker-compose.hysteria.yml).
+HYSTERIA="${HYSTERIA:-off}"
+
+# Список compose-файлов собирается один раз и используется везде: при запуске,
+# в cron и в итоговой справке. Иначе --remove-orphans снесёт контейнеры,
+# объявленные в неподключённых override-файлах.
+COMPOSE_FILES=(-f docker-compose.yml)
+if [ "$PROXY_MODE" = "warp" ]; then
+    COMPOSE_FILES+=(-f docker-compose.warp.yml)
+fi
+if [ "$HYSTERIA" = "on" ]; then
+    COMPOSE_FILES+=(-f docker-compose.hysteria.yml)
+fi
 
 echo -e "  Домен:       ${GREEN}${DOMAIN}${NC}"
 echo -e "  Email:       ${GREEN}${EMAIL}${NC}"
 echo -e "  Timezone:    ${GREEN}${TIMEZONE}${NC}"
 echo -e "  SSH порт:    ${GREEN}${SSH_PORT}${NC}"
 echo -e "  Прокси:      ${GREEN}${PROXY_MODE}${NC}"
+echo -e "  Hysteria2:   ${GREEN}${HYSTERIA}${NC}"
 
 # ════════════════════════════════════════════════════════════════════════════
 # ШАГ 1 — Зависимости
@@ -106,7 +123,7 @@ else
 fi
 
 ok "docker $(docker --version | awk '{print $3}' | tr -d ',')"
-ok "${DC[*]} ${_dc_ver}"
+ok "$(IFS=' '; echo "${DC[*]}") ${_dc_ver}"
 ok "envsubst $(envsubst --version 2>&1 | head -1)"
 
 # UFW: прописываем правила независимо от того, включён UFW или нет.
@@ -132,12 +149,65 @@ fi
 step 2 "Создание директорий"
 
 mkdir -p certbot/{conf,www} \
-         logs/{nginx,3x-ui,certbot}
+         logs/{3x-ui,certbot}
+
+# Ограничение логов Docker глобально (покрывает временные контейнеры certbot/nginx-init)
+_daemon_cfg=/etc/docker/daemon.json
+if [ ! -f "$_daemon_cfg" ] || ! grep -q '"max-size"' "$_daemon_cfg"; then
+    _tmp=$(mktemp)
+    if [ -f "$_daemon_cfg" ] && [ -s "$_daemon_cfg" ]; then
+        # Влить в существующий JSON
+        python3 -c "
+import json, sys
+d = json.load(open('$_daemon_cfg'))
+d.setdefault('log-driver','json-file')
+d.setdefault('log-opts',{}).update({'max-size':'10m','max-file':'3'})
+print(json.dumps(d, indent=2))
+" > "$_tmp"
+    else
+        echo '{"log-driver":"json-file","log-opts":{"max-size":"10m","max-file":"3"}}' > "$_tmp"
+    fi
+    mv "$_tmp" "$_daemon_cfg"
+    systemctl reload docker 2>/dev/null || true
+    ok "Docker log rotation настроен (10m × 3 файла)"
+else
+    ok "Docker log rotation уже настроен"
+fi
 
 chmod 700 certbot/conf
-chmod 755 certbot/www logs logs/nginx logs/3x-ui logs/certbot
+chmod 755 certbot/www logs logs/3x-ui logs/certbot
 
 ok "Директории готовы"
+
+# ── Сетевой тюнинг хоста ────────────────────────────────────────────────────
+# BBR вместо cubic. Cubic трактует любой скачок задержки как перегрузку и режет
+# окно вдвое — на мобильных сетях с джиттером в сотни миллисекунд это роняет
+# скорость в разы. BBR ориентируется на измеренную пропускную способность.
+# Буферы: при RTT 400 мс для 10 Мбит/с нужно ~500 КБ «в полёте», дефолтных
+# 208 КБ не хватает; 8 МБ заодно покрывают запрос quic-go для HTTP/3 и Hysteria.
+#
+# Важно: sysctl хоста НЕ распространяется на контейнеры — у каждого свой сетевой
+# namespace. Congestion control контейнеров задан в docker-compose.yml (sysctls:),
+# и это критично для sslh, который терминирует внешнее TCP-соединение клиента.
+_sysctl_cfg=/etc/sysctl.d/99-vpn-tuning.conf
+cat > "$_sysctl_cfg" << 'SYSCTL'
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+net.core.rmem_max = 8388608
+net.core.wmem_max = 8388608
+net.ipv4.tcp_rmem = 4096 131072 8388608
+net.ipv4.tcp_wmem = 4096 16384 8388608
+net.ipv4.tcp_mtu_probing = 1
+SYSCTL
+
+if sysctl -p "$_sysctl_cfg" >/dev/null 2>&1; then
+    # default_qdisc применяется только к новым интерфейсам — существующим меняем вручную
+    _iface=$(ip route show default | awk '/default/ {print $5; exit}')
+    [ -n "$_iface" ] && tc qdisc replace dev "$_iface" root fq 2>/dev/null || true
+    ok "Сетевой тюнинг: BBR + fq, буферы 8 МБ"
+else
+    fail "Не удалось применить сетевой тюнинг (нужен BBR в ядре: sysctl net.ipv4.tcp_available_congestion_control)"
+fi
 
 # ════════════════════════════════════════════════════════════════════════════
 # ШАГ 3 — Генерация конфигов из шаблонов
@@ -145,14 +215,32 @@ ok "Директории готовы"
 
 step 3 "Генерация конфигов"
 
-[ -f config/nginx/nginx.conf ]      || die "Не найден config/nginx/nginx.conf"
+[ -f config/caddy/Caddyfile ]       || die "Не найден config/caddy/Caddyfile"
 [ -f config/nginx/nginx-init.conf ] || die "Не найден config/nginx/nginx-init.conf"
 
-cp config/nginx/nginx.conf nginx.conf
-ok "nginx.conf"
+envsubst '${DOMAIN}' < config/caddy/Caddyfile > Caddyfile
+ok "Caddyfile"
 
 cp config/nginx/nginx-init.conf nginx-init.conf
 ok "nginx-init.conf (временный, для certbot)"
+
+if [ "$HYSTERIA" = "on" ]; then
+    [ -f config/hysteria/config.yaml ] || die "Не найден config/hysteria/config.yaml"
+
+    # Пароль генерируется один раз и дописывается в .env, чтобы переустановка
+    # не сбрасывала доступ у уже настроенных клиентов.
+    if [ -z "${HYSTERIA_PASSWORD:-}" ]; then
+        HYSTERIA_PASSWORD=$(head -c 24 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 28)
+        printf 'HYSTERIA_PASSWORD=%s\n' "$HYSTERIA_PASSWORD" >> .env
+        ok "Сгенерирован HYSTERIA_PASSWORD"
+    fi
+    export HYSTERIA_PASSWORD
+
+    envsubst '${DOMAIN} ${HYSTERIA_PASSWORD}' \
+        < config/hysteria/config.yaml > config/hysteria/config.generated.yaml
+    chmod 600 config/hysteria/config.generated.yaml
+    ok "config/hysteria/config.generated.yaml (пароль из .env)"
+fi
 
 # ════════════════════════════════════════════════════════════════════════════
 # ШАГ 4 — Получение SSL-сертификата
@@ -167,11 +255,22 @@ if [ -f "$CERT" ]; then
 else
     # Запустить временный nginx только с HTTP (без SSL-блоков — сертификата ещё нет)
     echo "  Запуск временного nginx для webroot..."
-    docker run -d --rm --name nginx-certbot-init \
+    docker stop nginx-certbot-init 2>/dev/null || true
+    if ! docker run -d --rm --name nginx-certbot-init \
         -p 80:80 \
         -v "$(pwd)/nginx-init.conf:/etc/nginx/conf.d/default.conf:ro" \
         -v "$(pwd)/certbot/www:/var/www/certbot" \
-        nginx:alpine >/dev/null
+        nginx:alpine; then
+        die "Не удалось запустить nginx на порту 80. Проверьте: ss -tlnp | grep :80"
+    fi
+
+    # Подождать, пока nginx полностью поднимется (bash /dev/tcp — без внешних зависимостей)
+    _retries=10
+    until bash -c 'echo >/dev/tcp/localhost/80' 2>/dev/null || [ $_retries -eq 0 ]; do
+        sleep 1; _retries=$((_retries - 1))
+    done
+    [ $_retries -gt 0 ] || { docker stop nginx-certbot-init 2>/dev/null || true; die "nginx не ответил на порту 80 за 10 секунд. Проверьте: ss -tlnp | grep :80"; }
+    ok "nginx слушает порт 80"
 
     echo "  Запрос сертификата для: ${DOMAIN}"
 
@@ -222,14 +321,11 @@ step 5 "Запуск Docker-контейнеров"
 # Убедиться, что порт 80 свободен
 docker stop nginx-certbot-init 2>/dev/null || true
 
-"${DC[@]}" pull --quiet
+"${DC[@]}" "${COMPOSE_FILES[@]}" pull --quiet
 
-# Если включён WARP — подключить override-файл с warp-контейнером
-if [ "$PROXY_MODE" = "warp" ]; then
-    "${DC[@]}" -f docker-compose.yml -f docker-compose.warp.yml up -d --remove-orphans
-else
-    "${DC[@]}" up -d --remove-orphans
-fi
+# COMPOSE_FILES собран выше по PROXY_MODE и HYSTERIA. Передавать его обязательно:
+# --remove-orphans удалит контейнеры из override-файлов, которые не подключены.
+"${DC[@]}" "${COMPOSE_FILES[@]}" up -d --remove-orphans
 
 ok "Контейнеры запущены"
 
@@ -243,7 +339,7 @@ sleep 5
 "${DC[@]}" ps
 
 _failed=0
-for _svc in sslh nginx 3x-ui; do
+for _svc in sslh caddy 3x-ui; do
     _state=$(docker inspect --format='{{.State.Status}}' "$_svc" 2>/dev/null || echo "missing")
     if [ "$_state" = "running" ]; then
         ok "$_svc — running"
@@ -263,22 +359,23 @@ step 7 "Настройка перезапуска XRay после renewal"
 
 CRON_FILE="/etc/cron.d/xray-cert-reload"
 _PROJECT_DIR="$(pwd)"
-_DC_STR="${DC[*]}"
-# При PROXY_MODE=warp в cron нужно передавать оба compose-файла,
-# иначе --remove-orphans удалит warp-контейнер как "чужой".
-if [ "$PROXY_MODE" = "warp" ]; then
-    _DC_UP="${_DC_STR} -f docker-compose.yml -f docker-compose.warp.yml"
-else
-    _DC_UP="${_DC_STR}"
+_DC_UP="$(IFS=' '; echo "${DC[*]} ${COMPOSE_FILES[*]}")"
+
+# Сертификат читает Caddy (он терминирует TLS), а не XRay — у XRay security: none.
+# caddy reload перечитывает сертификат без разрыва соединений.
+_CERT_RELOAD='docker exec caddy caddy reload --config /etc/caddy/Caddyfile'
+if [ "$HYSTERIA" = "on" ]; then
+    # Hysteria2 читает сертификат при старте, поэтому её нужно перезапустить.
+    _CERT_RELOAD="${_CERT_RELOAD} && docker restart hysteria"
 fi
+
 cat > "$CRON_FILE" << CRON
 SHELL=/bin/bash
 PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
 
-# XRay читает сертификат при старте — перезапускаем контейнер после renewal.
-# Certbot обновляет сертификат за 30 дней до истечения; ежесуточного рестарта достаточно.
-# Запуск в 4:00 ночи — минимум активных соединений, ~30 сек даунтайма.
-0 4 * * * root docker restart 3x-ui >> /var/log/xray-cert-reload.log 2>&1
+# Certbot обновляет сертификат за 30 дней до истечения; ежесуточной перезагрузки достаточно.
+# Запуск в 4:00 ночи — минимум активных соединений.
+0 4 * * * root ${_CERT_RELOAD} >> /var/log/xray-cert-reload.log 2>&1
 
 # Автообновление Docker-образов
 # Запуск раз в неделю в воскресенье в 3:00 ночи.
@@ -356,19 +453,33 @@ echo -e "  Затем открыть: ${BLUE}http://localhost:2053${NC}"
 echo -e "  Логин: ${YELLOW}admin${NC}   Пароль: ${YELLOW}admin${NC}  ${RED}← сразу смените!${NC}"
 
 echo ""
+# IP сервера — для подсказки по dns.hosts в клиентском конфиге
+DOMAIN_IP=$(getent hosts "${DOMAIN}" 2>/dev/null | awk '{print $1; exit}')
+[ -n "$DOMAIN_IP" ] || DOMAIN_IP="<ip сервера>"
+
 echo -e "${GREEN}Настройка XRay Inbound в панели:${NC}"
-echo "  Protocol:    VLESS"
-echo "  Port:        10000"
-echo "  Transmission: TCP (RAW)"
-echo "  TLS:         включить"
-echo "  uTLS:        none"
-echo "  ALPN:        http/1.1  ← убрать h2, оставить только это"
-echo "  Certificate: /etc/letsencrypt/live/${DOMAIN}/fullchain.pem"
-echo "  Key:         /etc/letsencrypt/live/${DOMAIN}/privkey.pem"
-echo "  SNI клиента: ${DOMAIN}"
+echo "  Protocol:     VLESS"
+echo "  Port:         10000"
+echo -e "  Security:     ${YELLOW}None${NC}  — TLS снимает Caddy, не XRay."
+echo "                Пути к сертификатам в панели указывать не нужно."
 echo ""
-echo -e "${GREEN}Fallback (чтобы фейковый сайт открывался на прямой HTTPS):${NC}"
-echo '  В поле Fallbacks добавить: [{"dest":"nginx:8080","xVer":0}]'
+echo -e "${GREEN}Вариант A — xHTTP (рекомендуется, обходит DPI):${NC}"
+echo "  Transmission: xHTTP"
+echo "  Path:         /game  (или любой другой)"
+echo "  Host:         ${DOMAIN}"
+echo "  Mode:         auto   — режим выбирает клиент"
+echo ""
+echo -e "  ${YELLOW}Ссылку из панели импортировать нельзя:${NC} она содержит внутренний"
+echo -e "  ${YELLOW}порт 10000 и security=none. Приведите её к рабочему виду:${NC}"
+echo "    python3 tools/xui-link.py '<ссылка из панели>'"
+echo "  Для мобильных сетей добавьте --ip ${DOMAIN_IP} и импортируйте"
+echo "  выданный JSON: xmux через ссылку не передаётся."
+echo ""
+echo -e "${GREEN}Вариант B — TCP/RAW (проще, но хуже обходит блокировки):${NC}"
+echo "  Transmission: TCP (RAW)"
+echo "  TLS:          включить,  uTLS: none,  ALPN: http/1.1"
+echo "  SNI клиента:  ${DOMAIN}"
+echo "  Fallback:     [{\"dest\":\"caddy:8080\",\"xVer\":0}]"
 
 if [ "$PROXY_MODE" != "off" ]; then
     echo ""
@@ -381,12 +492,25 @@ if [ "$PROXY_MODE" != "off" ]; then
 fi
 
 echo ""
-_dc="${DC[*]}"
+
+if [ "$HYSTERIA" = "on" ]; then
+    echo ""
+    echo -e "${GREEN}Hysteria2 (QUIC/UDP на :443/udp):${NC}"
+    echo -e "  ${YELLOW}v2rayNG этот протокол не поддерживает — нужен Hiddify, NekoBox или sing-box.${NC}"
+    echo ""
+    echo "  Ссылка для импорта (общая на всех клиентов):"
+    echo "    hy2://${HYSTERIA_PASSWORD}@${DOMAIN}:443/?sni=${DOMAIN}#${DOMAIN}-hy2"
+    echo ""
+    echo -e "  ${YELLOW}В клиенте задайте полосу (Upload/Download Mbps) чуть ниже реальной${NC}"
+    echo -e "  ${YELLOW}скорости канала — иначе не включится Brutal и смысл транспорта теряется.${NC}"
+    echo -e "  ${YELLOW}Если на сервере нет IPv6 — выставьте в клиенте IPv6 Mode = Disable.${NC}"
+fi
+_dc=$(IFS=" "; echo "${DC[*]} ${COMPOSE_FILES[*]}")
 echo -e "${GREEN}Полезные команды:${NC}"
 echo "  ${_dc} ps                       # состояние контейнеров"
 echo "  ${_dc} logs -f 3x-ui            # логи панели / XRay"
-echo "  ${_dc} logs -f nginx            # логи nginx"
+echo "  ${_dc} logs -f caddy            # логи Caddy"
 echo "  ${_dc} logs -f sslh             # логи мультиплексора"
-echo "  ${_dc} restart nginx            # перезапуск nginx"
+echo "  ${_dc} restart caddy            # перезапуск Caddy"
 echo "  ${_dc} pull && ${_dc} up -d     # обновить образы"
 echo ""

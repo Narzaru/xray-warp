@@ -1,0 +1,38 @@
+# Шаблон конфигурации Hysteria2. Реальный файл генерируется через envsubst:
+#   envsubst '${DOMAIN} ${HYSTERIA_PASSWORD}' \
+#       < config/hysteria/config.yaml > config/hysteria/config.generated.yaml
+# Сгенерированный файл содержит пароль и в git не попадает (см. .gitignore).
+
+# UDP 443 — не конфликтует с sslh, который слушает TCP 443.
+# Для оператора выглядит как QUIC/HTTP3, то есть обычный веб-трафик.
+listen: :443
+
+tls:
+  cert: /etc/letsencrypt/live/${DOMAIN}/fullchain.pem
+  key: /etc/letsencrypt/live/${DOMAIN}/privkey.pem
+
+auth:
+  # Один общий пароль на всех клиентов.
+  type: password
+  password: ${HYSTERIA_PASSWORD}
+
+# Маскировка: на посторонние запросы отдаём фейковый сайт с nginx.
+# Пробинг снаружи видит обычный веб-сервер, а не прокси.
+masquerade:
+  type: proxy
+  proxy:
+    url: http://nginx:8080/
+    rewriteHost: true
+
+# Окна QUIC увеличены под канал с высоким RTT (мобильный интернет: 100-300 мс).
+# При дефолтных значениях окно становится узким местом раньше, чем канал.
+quic:
+  initStreamReceiveWindow: 8388608
+  maxStreamReceiveWindow: 8388608
+  initConnReceiveWindow: 20971520
+  maxConnReceiveWindow: 20971520
+
+# false — клиент объявляет свою полосу, что включает алгоритм Brutal:
+# он держит заданную скорость при потерях вместо отступления, как TCP.
+# Это и есть смысл Hysteria2 на канале с потерями.
+ignoreClientBandwidth: false
