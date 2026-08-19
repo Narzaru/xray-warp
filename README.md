@@ -300,34 +300,59 @@ Hysteria2 использует QUIC поверх UDP с алгоритмом Bru
 
 ### Запуск
 
+Ставится тем же скриптом, рядом с основным стеком — в `.env`:
+
 ```bash
-# 1. Сгенерировать пароль и записать в .env
-echo "HYSTERIA_PASSWORD=$(openssl rand -base64 24 | tr -dc 'A-Za-z0-9' | head -c 28)" >> .env
-
-# 2. Сгенерировать конфиг из шаблона
-export $(grep -E '^(DOMAIN|HYSTERIA_PASSWORD)=' .env | xargs)
-envsubst '${DOMAIN} ${HYSTERIA_PASSWORD}' \
-    < config/hysteria/config.yaml > config/hysteria/config.generated.yaml
-chmod 600 config/hysteria/config.generated.yaml
-
-# 3. Поднять только этот сервис, не трогая остальные
-docker compose -f docker-compose.yml -f docker-compose.hysteria.yml up -d --no-deps hysteria
+HYSTERIA=on
 ```
 
-Файл `config.generated.yaml` содержит пароль и в git не попадает (см. `.gitignore`).
+и `./setup-3xui.sh`. Скрипт сам сгенерирует пароли клиентов, допишет их в `.env`,
+соберёт конфиг из шаблона и поднимет контейнер. Порт `443/udp` при этом ничего
+не переназначает: `443/tcp` остаётся за sslh, это независимые порты.
 
-### Клиент
+Пароли генерируются один раз. При повторном запуске скрипт видит уже заданные
+значения и не трогает их, поэтому переустановка не сбрасывает доступ у настроенных
+клиентов. Файл `config/hysteria/config.generated.yaml` содержит пароли и в git
+не попадает (см. `.gitignore`).
 
-v2rayNG Hysteria2 **не поддерживает** — нужен Hiddify, NekoBox или sing-box.
-Ссылка для импорта:
+### Клиенты
+
+Пользователи задаются в шаблоне `config/hysteria/config.yaml` в режиме `userpass` —
+у каждого свой логин и пароль, любого можно отозвать отдельно:
+
+```yaml
+auth:
+  type: userpass
+  userpass:
+    yaroslav: ${HYSTERIA_PASS_YAROSLAV}
+    mama: ${HYSTERIA_PASS_MAMA}
+    papa: ${HYSTERIA_PASS_PAPA}
+```
+
+Чтобы добавить ещё одного — допишите строку в шаблон, добавьте переменную
+в `.env.example` и в блок генерации паролей в `setup-3xui.sh`.
+
+Ссылки на подключение скрипт печатает в конце установки:
 
 ```
-hy2://ПАРОЛЬ@yourdomain.com:443/?sni=yourdomain.com#имя-профиля
+hy2://ЛОГИН:ПАРОЛЬ@yourdomain.com:443/?sni=yourdomain.com#имя-профиля
 ```
 
-После импорта задайте полосу (**Upload / Download Mbps**) чуть ниже реальной скорости канала —
-без этого не включится Brutal и смысл транспорта теряется. Завышать нельзя: клиент начнёт
-заливать канал сверх ёмкости и сам создаст потери.
+Показать их повторно, не переустанавливая:
+
+```bash
+source .env
+for u in yaroslav mama papa; do
+    v="HYSTERIA_PASS_$(echo "$u" | tr '[:lower:]' '[:upper:]')"
+    echo "$u: hy2://${u}:${!v}@${DOMAIN}:443/?sni=${DOMAIN}#${DOMAIN}-${u}"
+done
+```
+
+**v2rayNG Hysteria2 не поддерживает** — нужен Hiddify, NekoBox или sing-box.
+
+После импорта задайте полосу (**Upload / Download Mbps**) чуть ниже реальной скорости
+канала — без этого не включится Brutal и смысл транспорта теряется. Завышать нельзя:
+клиент начнёт заливать канал сверх ёмкости и сам создаст потери.
 
 > **IPv6.** Если на сервере нет IPv6, в клиенте нужно выставить **IPv6 Mode = Disable**.
 > Иначе клиент присылает IPv6-адреса назначения, сервер не может их набрать, а туннель
@@ -335,6 +360,8 @@ hy2://ПАРОЛЬ@yourdomain.com:443/?sni=yourdomain.com#имя-профиля
 > с IPv6 (в первую очередь Google) висят до таймаута.
 
 ### Удаление
+
+В `.env` поставить `HYSTERIA=off` и перезапустить скрипт, либо вручную:
 
 ```bash
 docker compose -f docker-compose.yml -f docker-compose.hysteria.yml rm -sf hysteria
@@ -353,14 +380,18 @@ ufw status
 
 ## SSL-сертификат
 
-Сертификат выпускается автоматически на шаге 4. Certbot-контейнер проверяет обновление каждые 12 часов. После обновления cron-задача перезапускает контейнер 3x-ui (XRay читает сертификат при старте):
+Сертификат выпускается автоматически на шаге 4. Certbot-контейнер проверяет обновление каждые 12 часов. Сертификат читает **nginx** (он терминирует TLS), поэтому cron-задача перечитывает его конфиг:
 
 ```
 # /etc/cron.d/xray-cert-reload
-0 4 * * * root docker restart 3x-ui
+0 4 * * * root docker exec nginx nginx -s reload
 ```
 
-> **Даунтайм**: перезапуск занимает ~30 секунд. Выбрано 4:00 ночи — минимум активных соединений. Certbot обновляет сертификат за 30 дней до истечения, ежесуточного рестарта достаточно.
+При `HYSTERIA=on` в ту же задачу добавляется `&& docker restart hysteria` — Hysteria2 читает сертификат при старте и требует перезапуска.
+
+> **Даунтайм**: `nginx -s reload` перечитывает конфиг без разрыва соединений — даунтайма нет. Перезапуск Hysteria2 занимает пару секунд. Выбрано 4:00 ночи — минимум активных соединений.
+>
+> ⚠️ Перезапускать `3x-ui` после обновления сертификата **не нужно**: у XRay `security: none`, сертификатов он не читает. Если вы вернули терминирование TLS в XRay (вариант TCP/RAW), верните и `docker restart 3x-ui` в cron.
 
 ## Полезные команды
 

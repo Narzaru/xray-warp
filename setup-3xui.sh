@@ -2,11 +2,13 @@
 # setup-3xui.sh — установка 3x-ui + XRay + Nginx + sslh в Docker
 #
 # Архитектура порта 443:
-#   Интернет :443 → [sslh]
-#                     ├── SSH  → host sshd (порт из .env)
-#                     └── TLS  → [3x-ui XRay :10000]
-#                                  ├── VLESS             → proxy out
-#                                  └── fallback (HTTP)   → nginx :8080 (фейковый сайт)
+#   Интернет :443/tcp → [sslh]
+#                         ├── SSH → host sshd (порт из .env)
+#                         └── TLS → [nginx :8443]  ← TLS терминирует nginx
+#                                      ├── /game          → [XRay :10000] xhttp без TLS
+#                                      └── всё остальное  → фейковый сайт
+#
+#   Интернет :443/udp → [hysteria]  (опционально, HYSTERIA=on в .env)
 #
 # Зависимости: docker, docker-compose, envsubst (пакет gettext-base)
 #
@@ -68,11 +70,26 @@ SSH_PORT="${SSH_PORT:-22}"
 PROXY_MODE="${PROXY_MODE:-off}"
 export DOMAIN TIMEZONE SSH_PORT PROXY_MODE
 
+# Hysteria2 — опциональный транспорт QUIC/UDP (docker-compose.hysteria.yml).
+HYSTERIA="${HYSTERIA:-off}"
+
+# Список compose-файлов собирается один раз и используется везде: при запуске,
+# в cron и в итоговой справке. Иначе --remove-orphans снесёт контейнеры,
+# объявленные в неподключённых override-файлах.
+COMPOSE_FILES=(-f docker-compose.yml)
+if [ "$PROXY_MODE" = "warp" ]; then
+    COMPOSE_FILES+=(-f docker-compose.warp.yml)
+fi
+if [ "$HYSTERIA" = "on" ]; then
+    COMPOSE_FILES+=(-f docker-compose.hysteria.yml)
+fi
+
 echo -e "  Домен:       ${GREEN}${DOMAIN}${NC}"
 echo -e "  Email:       ${GREEN}${EMAIL}${NC}"
 echo -e "  Timezone:    ${GREEN}${TIMEZONE}${NC}"
 echo -e "  SSH порт:    ${GREEN}${SSH_PORT}${NC}"
 echo -e "  Прокси:      ${GREEN}${PROXY_MODE}${NC}"
+echo -e "  Hysteria2:   ${GREEN}${HYSTERIA}${NC}"
 
 # ════════════════════════════════════════════════════════════════════════════
 # ШАГ 1 — Зависимости
@@ -177,6 +194,28 @@ ok "nginx.conf"
 cp config/nginx/nginx-init.conf nginx-init.conf
 ok "nginx-init.conf (временный, для certbot)"
 
+if [ "$HYSTERIA" = "on" ]; then
+    [ -f config/hysteria/config.yaml ] || die "Не найден config/hysteria/config.yaml"
+
+    # Пароли генерируются один раз и дописываются в .env, чтобы переустановка
+    # не сбрасывала доступ у уже настроенных клиентов.
+    for _u in YAROSLAV MAMA PAPA; do
+        _var="HYSTERIA_PASS_${_u}"
+        if [ -z "${!_var:-}" ]; then
+            _pass=$(head -c 24 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 28)
+            printf '%s=%s\n' "$_var" "$_pass" >> .env
+            export "$_var=$_pass"
+            ok "Сгенерирован ${_var}"
+        fi
+    done
+    export HYSTERIA_PASS_YAROSLAV HYSTERIA_PASS_MAMA HYSTERIA_PASS_PAPA
+
+    envsubst '${DOMAIN} ${HYSTERIA_PASS_YAROSLAV} ${HYSTERIA_PASS_MAMA} ${HYSTERIA_PASS_PAPA}' \
+        < config/hysteria/config.yaml > config/hysteria/config.generated.yaml
+    chmod 600 config/hysteria/config.generated.yaml
+    ok "config/hysteria/config.generated.yaml (пароли из .env)"
+fi
+
 # ════════════════════════════════════════════════════════════════════════════
 # ШАГ 4 — Получение SSL-сертификата
 # ════════════════════════════════════════════════════════════════════════════
@@ -256,14 +295,11 @@ step 5 "Запуск Docker-контейнеров"
 # Убедиться, что порт 80 свободен
 docker stop nginx-certbot-init 2>/dev/null || true
 
-"${DC[@]}" pull --quiet
+"${DC[@]}" "${COMPOSE_FILES[@]}" pull --quiet
 
-# Если включён WARP — подключить override-файл с warp-контейнером
-if [ "$PROXY_MODE" = "warp" ]; then
-    "${DC[@]}" -f docker-compose.yml -f docker-compose.warp.yml up -d --remove-orphans
-else
-    "${DC[@]}" up -d --remove-orphans
-fi
+# COMPOSE_FILES собран выше по PROXY_MODE и HYSTERIA. Передавать его обязательно:
+# --remove-orphans удалит контейнеры из override-файлов, которые не подключены.
+"${DC[@]}" "${COMPOSE_FILES[@]}" up -d --remove-orphans
 
 ok "Контейнеры запущены"
 
@@ -297,22 +333,23 @@ step 7 "Настройка перезапуска XRay после renewal"
 
 CRON_FILE="/etc/cron.d/xray-cert-reload"
 _PROJECT_DIR="$(pwd)"
-_DC_STR=$(IFS=' '; echo "${DC[*]}")
-# При PROXY_MODE=warp в cron нужно передавать оба compose-файла,
-# иначе --remove-orphans удалит warp-контейнер как "чужой".
-if [ "$PROXY_MODE" = "warp" ]; then
-    _DC_UP="${_DC_STR} -f docker-compose.yml -f docker-compose.warp.yml"
-else
-    _DC_UP="${_DC_STR}"
+_DC_UP="$(IFS=' '; echo "${DC[*]} ${COMPOSE_FILES[*]}")"
+
+# Сертификат читает nginx (он терминирует TLS), а не XRay — у XRay security: none.
+# nginx -s reload перечитывает сертификат без разрыва соединений.
+_CERT_RELOAD='docker exec nginx nginx -s reload'
+if [ "$HYSTERIA" = "on" ]; then
+    # Hysteria2 читает сертификат при старте, поэтому её нужно перезапустить.
+    _CERT_RELOAD="${_CERT_RELOAD} && docker restart hysteria"
 fi
+
 cat > "$CRON_FILE" << CRON
 SHELL=/bin/bash
 PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
 
-# XRay читает сертификат при старте — перезапускаем контейнер после renewal.
-# Certbot обновляет сертификат за 30 дней до истечения; ежесуточного рестарта достаточно.
-# Запуск в 4:00 ночи — минимум активных соединений, ~30 сек даунтайма.
-0 4 * * * root docker restart 3x-ui >> /var/log/xray-cert-reload.log 2>&1
+# Certbot обновляет сертификат за 30 дней до истечения; ежесуточной перезагрузки достаточно.
+# Запуск в 4:00 ночи — минимум активных соединений.
+0 4 * * * root ${_CERT_RELOAD} >> /var/log/xray-cert-reload.log 2>&1
 
 # Автообновление Docker-образов
 # Запуск раз в неделю в воскресенье в 3:00 ночи.
@@ -420,7 +457,23 @@ if [ "$PROXY_MODE" != "off" ]; then
 fi
 
 echo ""
-_dc=$(IFS=' '; echo "${DC[*]}")
+
+if [ "$HYSTERIA" = "on" ]; then
+    echo ""
+    echo -e "${GREEN}Hysteria2 (QUIC/UDP на :443/udp):${NC}"
+    echo -e "  ${YELLOW}v2rayNG этот протокол не поддерживает — нужен Hiddify, NekoBox или sing-box.${NC}"
+    echo ""
+    echo "  Ссылки для импорта:"
+    for _u in yaroslav mama papa; do
+        _var="HYSTERIA_PASS_$(echo "$_u" | tr '[:lower:]' '[:upper:]')"
+        echo "    ${_u}:  hy2://${_u}:${!_var}@${DOMAIN}:443/?sni=${DOMAIN}#${DOMAIN}-${_u}"
+    done
+    echo ""
+    echo -e "  ${YELLOW}В клиенте задайте полосу (Upload/Download Mbps) чуть ниже реальной${NC}"
+    echo -e "  ${YELLOW}скорости канала — иначе не включится Brutal и смысл транспорта теряется.${NC}"
+    echo -e "  ${YELLOW}Если на сервере нет IPv6 — выставьте в клиенте IPv6 Mode = Disable.${NC}"
+fi
+_dc=$(IFS=" "; echo "${DC[*]} ${COMPOSE_FILES[*]}")
 echo -e "${GREEN}Полезные команды:${NC}"
 echo "  ${_dc} ps                       # состояние контейнеров"
 echo "  ${_dc} logs -f 3x-ui            # логи панели / XRay"
