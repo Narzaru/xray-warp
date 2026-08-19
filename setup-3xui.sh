@@ -1,10 +1,10 @@
 #!/bin/bash
-# setup-3xui.sh — установка 3x-ui + XRay + Nginx + sslh в Docker
+# setup-3xui.sh — установка 3x-ui + XRay + Caddy + sslh в Docker
 #
 # Архитектура порта 443:
 #   Интернет :443/tcp → [sslh]
 #                         ├── SSH → host sshd (порт из .env)
-#                         └── TLS → [nginx :8443]  ← TLS терминирует nginx
+#                         └── TLS → [caddy :8443]  ← TLS терминирует Caddy
 #                                      ├── /game          → [XRay :10000] xhttp без TLS
 #                                      └── всё остальное  → фейковый сайт
 #
@@ -149,7 +149,7 @@ fi
 step 2 "Создание директорий"
 
 mkdir -p certbot/{conf,www} \
-         logs/{nginx,3x-ui,certbot}
+         logs/{3x-ui,certbot}
 
 # Ограничение логов Docker глобально (покрывает временные контейнеры certbot/nginx-init)
 _daemon_cfg=/etc/docker/daemon.json
@@ -175,9 +175,39 @@ else
 fi
 
 chmod 700 certbot/conf
-chmod 755 certbot/www logs logs/nginx logs/3x-ui logs/certbot
+chmod 755 certbot/www logs logs/3x-ui logs/certbot
 
 ok "Директории готовы"
+
+# ── Сетевой тюнинг хоста ────────────────────────────────────────────────────
+# BBR вместо cubic. Cubic трактует любой скачок задержки как перегрузку и режет
+# окно вдвое — на мобильных сетях с джиттером в сотни миллисекунд это роняет
+# скорость в разы. BBR ориентируется на измеренную пропускную способность.
+# Буферы: при RTT 400 мс для 10 Мбит/с нужно ~500 КБ «в полёте», дефолтных
+# 208 КБ не хватает; 8 МБ заодно покрывают запрос quic-go для HTTP/3 и Hysteria.
+#
+# Важно: sysctl хоста НЕ распространяется на контейнеры — у каждого свой сетевой
+# namespace. Congestion control контейнеров задан в docker-compose.yml (sysctls:),
+# и это критично для sslh, который терминирует внешнее TCP-соединение клиента.
+_sysctl_cfg=/etc/sysctl.d/99-vpn-tuning.conf
+cat > "$_sysctl_cfg" << 'SYSCTL'
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+net.core.rmem_max = 8388608
+net.core.wmem_max = 8388608
+net.ipv4.tcp_rmem = 4096 131072 8388608
+net.ipv4.tcp_wmem = 4096 16384 8388608
+net.ipv4.tcp_mtu_probing = 1
+SYSCTL
+
+if sysctl -p "$_sysctl_cfg" >/dev/null 2>&1; then
+    # default_qdisc применяется только к новым интерфейсам — существующим меняем вручную
+    _iface=$(ip route show default | awk '/default/ {print $5; exit}')
+    [ -n "$_iface" ] && tc qdisc replace dev "$_iface" root fq 2>/dev/null || true
+    ok "Сетевой тюнинг: BBR + fq, буферы 8 МБ"
+else
+    fail "Не удалось применить сетевой тюнинг (нужен BBR в ядре: sysctl net.ipv4.tcp_available_congestion_control)"
+fi
 
 # ════════════════════════════════════════════════════════════════════════════
 # ШАГ 3 — Генерация конфигов из шаблонов
@@ -185,11 +215,11 @@ ok "Директории готовы"
 
 step 3 "Генерация конфигов"
 
-[ -f config/nginx/nginx.conf ]      || die "Не найден config/nginx/nginx.conf"
+[ -f config/caddy/Caddyfile ]       || die "Не найден config/caddy/Caddyfile"
 [ -f config/nginx/nginx-init.conf ] || die "Не найден config/nginx/nginx-init.conf"
 
-envsubst '${DOMAIN}' < config/nginx/nginx.conf > nginx.conf
-ok "nginx.conf"
+envsubst '${DOMAIN}' < config/caddy/Caddyfile > Caddyfile
+ok "Caddyfile"
 
 cp config/nginx/nginx-init.conf nginx-init.conf
 ok "nginx-init.conf (временный, для certbot)"
@@ -309,7 +339,7 @@ sleep 5
 "${DC[@]}" ps
 
 _failed=0
-for _svc in sslh nginx 3x-ui; do
+for _svc in sslh caddy 3x-ui; do
     _state=$(docker inspect --format='{{.State.Status}}' "$_svc" 2>/dev/null || echo "missing")
     if [ "$_state" = "running" ]; then
         ok "$_svc — running"
@@ -331,9 +361,9 @@ CRON_FILE="/etc/cron.d/xray-cert-reload"
 _PROJECT_DIR="$(pwd)"
 _DC_UP="$(IFS=' '; echo "${DC[*]} ${COMPOSE_FILES[*]}")"
 
-# Сертификат читает nginx (он терминирует TLS), а не XRay — у XRay security: none.
-# nginx -s reload перечитывает сертификат без разрыва соединений.
-_CERT_RELOAD='docker exec nginx nginx -s reload'
+# Сертификат читает Caddy (он терминирует TLS), а не XRay — у XRay security: none.
+# caddy reload перечитывает сертификат без разрыва соединений.
+_CERT_RELOAD='docker exec caddy caddy reload --config /etc/caddy/Caddyfile'
 if [ "$HYSTERIA" = "on" ]; then
     # Hysteria2 читает сертификат при старте, поэтому её нужно перезапустить.
     _CERT_RELOAD="${_CERT_RELOAD} && docker restart hysteria"
@@ -440,7 +470,7 @@ echo -e "${GREEN}Вариант B — TCP/RAW (проще, но хуже обх�
 echo "  Transmission: TCP (RAW)"
 echo "  TLS:          включить,  uTLS: none,  ALPN: http/1.1"
 echo "  SNI клиента:  ${DOMAIN}"
-echo "  Fallback:     [{\"dest\":\"nginx:8080\",\"xVer\":0}]"
+echo "  Fallback:     [{\"dest\":\"caddy:8080\",\"xVer\":0}]"
 
 if [ "$PROXY_MODE" != "off" ]; then
     echo ""
@@ -470,8 +500,8 @@ _dc=$(IFS=" "; echo "${DC[*]} ${COMPOSE_FILES[*]}")
 echo -e "${GREEN}Полезные команды:${NC}"
 echo "  ${_dc} ps                       # состояние контейнеров"
 echo "  ${_dc} logs -f 3x-ui            # логи панели / XRay"
-echo "  ${_dc} logs -f nginx            # логи nginx"
+echo "  ${_dc} logs -f caddy            # логи Caddy"
 echo "  ${_dc} logs -f sslh             # логи мультиплексора"
-echo "  ${_dc} restart nginx            # перезапуск nginx"
+echo "  ${_dc} restart caddy            # перезапуск Caddy"
 echo "  ${_dc} pull && ${_dc} up -d     # обновить образы"
 echo ""
