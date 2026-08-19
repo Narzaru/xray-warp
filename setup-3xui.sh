@@ -66,7 +66,7 @@ _sys_tz=$(timedatectl show --property=Timezone --value 2>/dev/null \
 TIMEZONE="${TIMEZONE:-${_sys_tz}}"
 SSH_PORT="${SSH_PORT:-22}"
 PROXY_MODE="${PROXY_MODE:-off}"
-export TIMEZONE SSH_PORT PROXY_MODE
+export DOMAIN TIMEZONE SSH_PORT PROXY_MODE
 
 echo -e "  Домен:       ${GREEN}${DOMAIN}${NC}"
 echo -e "  Email:       ${GREEN}${EMAIL}${NC}"
@@ -171,7 +171,7 @@ step 3 "Генерация конфигов"
 [ -f config/nginx/nginx.conf ]      || die "Не найден config/nginx/nginx.conf"
 [ -f config/nginx/nginx-init.conf ] || die "Не найден config/nginx/nginx-init.conf"
 
-cp config/nginx/nginx.conf nginx.conf
+envsubst '${DOMAIN}' < config/nginx/nginx.conf > nginx.conf
 ok "nginx.conf"
 
 cp config/nginx/nginx-init.conf nginx-init.conf

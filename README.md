@@ -7,25 +7,34 @@
 ## Архитектура
 
 ```
-Интернет :443
-    │
-    ▼
- [sslh]  — мультиплексор по первым байтам пакета
-    ├── SSH  ──────────────────────► host sshd (порт из .env)
-    └── TLS  ──────────────────────► [3x-ui / XRay :10000]
-                                          │
-                                ┌─────────┴───────────┐
-                                │ VLESS-трафик        │ Всё остальное
-                                ▼                     ▼
-                           proxy out           [nginx :8080]
-                        (warp / vps / direct)   фейковый сайт
+Интернет :443/tcp                          Интернет :443/udp
+    │                                             │
+    ▼                                             ▼
+ [sslh]  — мультиплексор по первым байтам    [hysteria]  (опционально)
+    ├── SSH ─────────────► host sshd            QUIC/UDP, свой пароль
+    └── TLS ─────────────► [nginx :8443]        см. docker-compose.hysteria.yml
+                               │
+                    ┌──────────┴──────────┐
+                    │ /game               │ всё остальное
+                    ▼                     ▼
+            [3x-ui / XRay :10000]   фейковый сайт
+              xhttp БЕЗ TLS         (реальный 200 OK)
+                    │
+                    ▼
+                proxy out
+           (warp / vps / direct)
 ```
 
-- **sslh** — слушает `:443`, определяет протокол по первым байтам и маршрутизирует SSH на хост, TLS — в XRay
-- **XRay** (внутри 3x-ui) — терминирует TLS, обрабатывает VLESS-клиентов, некорректный трафик отдаёт nginx через fallback
-- **nginx** — отдаёт фейковый сайт по plain HTTP на внутреннем порту 8080 (снаружи недоступен), а также обслуживает порт 80 для ACME-challenge certbot
-- **certbot** — автоматически обновляет Let's Encrypt сертификат каждые 12 часов
-- **cron** — автоматически обновляет Docker-образы раз в неделю (воскресенье, 3:00)
+- **sslh** — слушает `:443/tcp`, определяет протокол по первым байтам: SSH уходит на хост, TLS — в nginx
+- **nginx** — **терминирует TLS** сертификатом Let's Encrypt. Путь `/game` проксирует в XRay, всё остальное отдаёт фейковым сайтом. Также обслуживает порт 80 для ACME-challenge
+- **XRay** (внутри 3x-ui) — принимает xhttp **без TLS** (`security: none`), TLS уже снят nginx
+- **hysteria** — опциональный транспорт QUIC/UDP на `:443/udp`. Нужен на каналах с потерями пакетов, где TCP обрушивает окно перегрузки
+- **certbot** — обновляет сертификат каждые 12 часов
+- **cron** — обновляет Docker-образы раз в неделю (воскресенье, 3:00)
+
+> **Почему TLS терминирует nginx, а не XRay.** При xhttp у XRay нет fallback: всё, что не совпало с путём `/game`, он просто отбрасывает. Домен с валидным сертификатом, отдающий 404 на любой запрос, — заметный признак при активном пробинге. С nginx впереди посторонний запрос получает настоящий сайт с настоящими заголовками.
+>
+> Для клиентов схема прозрачна: тот же домен, порт, путь и SNI. Точка снятия TLS переезжает внутри сервера и снаружи неотличима — конфиги менять не нужно.
 
 ## Требования
 
@@ -56,27 +65,30 @@ apt-get install -y docker.io docker-compose-v2 gettext-base
 
 ```
 .
-├── setup-3xui.sh              # скрипт установки
-├── docker-compose.yml         # основной стек
-├── docker-compose.warp.yml    # override для PROXY_MODE=warp
-├── .env.example               # шаблон переменных
+├── setup-3xui.sh                # скрипт установки
+├── docker-compose.yml           # основной стек
+├── docker-compose.warp.yml      # override для PROXY_MODE=warp
+├── docker-compose.hysteria.yml  # override для транспорта Hysteria2 (QUIC/UDP)
+├── .env.example                 # шаблон переменных
 ├── config/
 │   ├── nginx/
-│   │   ├── nginx.conf         # шаблон конфига nginx
-│   │   └── nginx-init.conf    # временный конфиг для первичного certbot
+│   │   ├── nginx.conf           # шаблон конфига nginx (TLS-фронт + фейковый сайт)
+│   │   └── nginx-init.conf      # временный конфиг для первичного certbot
+│   ├── hysteria/
+│   │   └── config.yaml          # шаблон конфига Hysteria2 (пароль из .env)
 │   └── xray/
-│       ├── outbound-warp.json # шаблон outbound через Cloudflare WARP
-│       └── outbound-vps.json  # шаблон outbound через exit VPS (VLESS)
+│       ├── outbound-warp.json   # шаблон outbound через Cloudflare WARP
+│       └── outbound-vps.json    # шаблон outbound через exit VPS (VLESS)
 └── html/
-    └── index.html             # фейковый корпоративный сайт
+    └── index.html               # фейковый корпоративный сайт
 ```
 
 После запуска скрипта в корне появятся:
 ```
-├── nginx.conf                 # сгенерированный конфиг nginx
-├── nginx-init.conf            # временный конфиг (можно удалить после установки)
-├── certbot/                   # SSL-сертификаты
-└── logs/                      # логи nginx, 3x-ui, certbot
+├── nginx.conf                   # сгенерированный конфиг nginx
+├── nginx-init.conf              # временный конфиг (можно удалить после установки)
+├── certbot/                     # SSL-сертификаты
+└── logs/                        # логи nginx, 3x-ui, certbot
 ```
 
 ## Установка
@@ -150,9 +162,11 @@ ssh -L 2053:localhost:2053 user@yourdomain.com
 |---|---|
 | Protocol | VLESS |
 | Port | 10000 |
-| Security | TLS |
-| Certificate File | `/etc/letsencrypt/live/yourdomain.com/fullchain.pem` |
-| Key File | `/etc/letsencrypt/live/yourdomain.com/privkey.pem` |
+| Security | **None** |
+
+> ⚠️ **Security именно `None`, а не TLS.** Сертификат подключает nginx, который стоит впереди
+> (см. раздел «Архитектура»). Если включить TLS ещё и здесь, nginx будет слать plain HTTP
+> в TLS-порт и туннель не поднимется. Пути к сертификатам в панели указывать не нужно.
 
 #### Вариант A — xHTTP (рекомендуется, лучше обходит DPI)
 
@@ -165,22 +179,32 @@ ssh -L 2053:localhost:2053 user@yourdomain.com
 | ALPN | `h2`, `http/1.1` |
 | SNI клиента | `yourdomain.com` |
 
-#### Вариант B — TCP/RAW (проще)
+#### Вариант B — TCP/RAW
+
+> ⚠️ **Несовместим с текущей архитектурой.** nginx впереди понимает HTTP, а не сырой VLESS,
+> поэтому TCP/RAW через него не пройдёт. Чтобы использовать этот вариант, нужно вернуть
+> терминирование TLS в XRay: в `docker-compose.yml` заменить `--tls=nginx:8443` на
+> `--tls=3x-ui:10000`, а в панели включить Security = TLS с путями к сертификатам.
+> Тогда фейковый сайт снова отдаётся через Fallbacks, а не через nginx-фронт.
+
+Параметры (при возврате TLS в XRay):
 
 | Поле | Значение |
 |---|---|
 | Transmission | TCP (RAW) |
+| Security | TLS |
+| Certificate File | `/etc/letsencrypt/live/yourdomain.com/fullchain.pem` |
+| Key File | `/etc/letsencrypt/live/yourdomain.com/privkey.pem` |
 | uTLS | none |
 | ALPN | `http/1.1` (убрать h2) |
 | SNI клиента | `yourdomain.com` |
 
-В секции **Fallbacks** добавить (только для TCP/RAW — при xHTTP fallback не нужен):
+В секции **Fallbacks** добавить:
 
 | Поле | Значение |
 |---|---|
 | Dest | `nginx:8080` |
 | xVer | `0` |
-
 Сохранить → **Restart XRay**.
 
 ### Подключение клиента
@@ -260,6 +284,62 @@ VPS_SNI=yourexit.domain.com
 ```
 
 Скрипт сгенерирует файл `outbound-config.json` и выведет его содержимое — вставить в **Settings → Xray Configs → Custom Config** и нажать Restart XRay.
+
+## Hysteria2 — транспорт для каналов с потерями
+
+xhttp работает поверх TCP. На канале, где теряется заметная доля пакетов (мобильные сети,
+особенно при активной фильтрации трафика), TCP обрушивает окно перегрузки и скорость падает
+в разы — это свойство алгоритма, а не настроек. Ни `cubic`, ни `BBR` тут не спасают.
+
+Hysteria2 использует QUIC поверх UDP с алгоритмом Brutal: он удерживает заданную полосу
+при потерях вместо отступления. На маршруте с 15–25% потерь разница получается кратной.
+
+Транспорт полностью изолирован: свой контейнер, свой протокол на `:443/udp`, свой пароль.
+3x-ui, XRay, sslh и конфиги существующих клиентов не затрагиваются. `443/tcp` и `443/udp` —
+независимые порты, конфликта нет.
+
+### Запуск
+
+```bash
+# 1. Сгенерировать пароль и записать в .env
+echo "HYSTERIA_PASSWORD=$(openssl rand -base64 24 | tr -dc 'A-Za-z0-9' | head -c 28)" >> .env
+
+# 2. Сгенерировать конфиг из шаблона
+export $(grep -E '^(DOMAIN|HYSTERIA_PASSWORD)=' .env | xargs)
+envsubst '${DOMAIN} ${HYSTERIA_PASSWORD}' \
+    < config/hysteria/config.yaml > config/hysteria/config.generated.yaml
+chmod 600 config/hysteria/config.generated.yaml
+
+# 3. Поднять только этот сервис, не трогая остальные
+docker compose -f docker-compose.yml -f docker-compose.hysteria.yml up -d --no-deps hysteria
+```
+
+Файл `config.generated.yaml` содержит пароль и в git не попадает (см. `.gitignore`).
+
+### Клиент
+
+v2rayNG Hysteria2 **не поддерживает** — нужен Hiddify, NekoBox или sing-box.
+Ссылка для импорта:
+
+```
+hy2://ПАРОЛЬ@yourdomain.com:443/?sni=yourdomain.com#имя-профиля
+```
+
+После импорта задайте полосу (**Upload / Download Mbps**) чуть ниже реальной скорости канала —
+без этого не включится Brutal и смысл транспорта теряется. Завышать нельзя: клиент начнёт
+заливать канал сверх ёмкости и сам создаст потери.
+
+> **IPv6.** Если на сервере нет IPv6, в клиенте нужно выставить **IPv6 Mode = Disable**.
+> Иначе клиент присылает IPv6-адреса назначения, сервер не может их набрать, а туннель
+> при этом соединение принимает — из-за чего браузер не переключается на IPv4 и сайты
+> с IPv6 (в первую очередь Google) висят до таймаута.
+
+### Удаление
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.hysteria.yml rm -sf hysteria
+rm -f config/hysteria/config.generated.yaml
+```
 
 ## Завершение
 
