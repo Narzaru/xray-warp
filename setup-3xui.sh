@@ -426,8 +426,16 @@ case "${PROXY_MODE}" in
     echo ""
     cat config/xray/routing-warp.json
     echo ""
+    echo -e "${YELLOW}3. Туда же — запасное правило, ПОД правилом warp:${NC}"
+    echo ""
+    cat config/xray/routing-direct.json
+    echo ""
+    echo -e "${YELLOW}Пока оно ниже, оно не срабатывает: warp перехватывает весь${NC}"
+    echo -e "${YELLOW}tcp,udp раньше. Если WARP сломается — поднимите его выше${NC}"
+    echo -e "${YELLOW}правила warp, и трафик пойдёт напрямую без правки конфигов.${NC}"
+    echo ""
     echo -e "${YELLOW}После сохранения нажмите «Restart XRay» в панели.${NC}"
-    echo -e "${YELLOW}Правило обязано лежать плоско в routing.rules: если вставить${NC}"
+    echo -e "${YELLOW}Правила обязаны лежать плоско в routing.rules: если вставить${NC}"
     echo -e "${YELLOW}блок routing целиком в Custom Config, панель вложит его внутрь${NC}"
     echo -e "${YELLOW}rules, и XRay не стартует (exit status 23).${NC}"
     ;;
@@ -451,6 +459,13 @@ case "${PROXY_MODE}" in
     echo -e "${YELLOW}2. Настройки → XRay Configs → Routing Rules — добавьте правило:${NC}"
     echo ""
     cat config/xray/routing-vps.json
+    echo ""
+    echo -e "${YELLOW}3. Туда же — запасное правило, ПОД правилом vps:${NC}"
+    echo ""
+    cat config/xray/routing-direct.json
+    echo ""
+    echo -e "${YELLOW}Если exit VPS отвалится — поднимите его выше, и трафик${NC}"
+    echo -e "${YELLOW}пойдёт напрямую.${NC}"
     echo ""
     echo -e "${YELLOW}После сохранения нажмите «Restart XRay» в панели.${NC}"
     ;;

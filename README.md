@@ -87,7 +87,8 @@ apt-get install -y docker.io docker-compose-v2 gettext-base
 │       ├── outbound-warp.json   # шаблон outbound через Cloudflare WARP
 │       ├── outbound-vps.json    # шаблон outbound через exit VPS (VLESS)
 │       ├── routing-warp.json    # правило маршрутизации в warp-out
-│       └── routing-vps.json     # правило маршрутизации в vps-out
+│       ├── routing-vps.json     # правило маршрутизации в vps-out
+│       └── routing-direct.json  # запасное правило: напрямую, если прокси лёг
 └── html/
     └── index.html               # фейковый корпоративный сайт
 ```
@@ -372,7 +373,7 @@ PROXY_MODE=warp
 
 Скрипт запустит отдельный `warp`-контейнер и выведет JSON-конфиг. После установки в панели нужно:
 
-1. **Settings → Xray Configs → Custom Config** — вставить outbound (`config/xray/outbound-warp.json`):
+1. **Settings → Xray Configs → Custom Config** — вставить outbounds (`config/xray/outbound-warp.json`):
 
 ```json
 {
@@ -383,7 +384,9 @@ PROXY_MODE=warp
       "settings": {
         "servers": [{"address": "warp", "port": 1080}]
       }
-    }
+    },
+    {"tag": "direct", "protocol": "freedom"},
+    {"tag": "blocked", "protocol": "blackhole", "settings": {"response": {"type": "http"}}}
   ]
 }
 ```
@@ -398,7 +401,21 @@ PROXY_MODE=warp
 }
 ```
 
-Сохранить → **Restart XRay**. Правило должно оказаться отдельным элементом `routing.rules` — вложенный блок `routing` роняет XRay, см. врезку выше.
+3. Туда же — запасное правило (`config/xray/routing-direct.json`), **ниже** правила warp:
+
+```json
+{
+  "type": "field",
+  "outboundTag": "direct",
+  "network": "tcp,udp"
+}
+```
+
+Сохранить → **Restart XRay**. Правила должны быть отдельными элементами `routing.rules` — вложенный блок `routing` роняет XRay, см. врезку выше.
+
+> **Зачем запасное правило.** Пока оно лежит ниже, оно мертво: правило warp перехватывает весь `tcp,udp` раньше. Но если WARP сломается — протухнет ключ, ляжет Cloudflare, застрянет healthcheck — весь трафик клиентов встанет, потому что единственный маршрут ведёт в него. Тогда правило поднимается выше warp прямо в панели, и трафик идёт напрямую с IP сервера: доступ возвращается в два клика, без SSH и правки конфигов. Обратно опускается так же.
+>
+> Порядок outbounds тоже имеет значение: `warp-out` стоит первым, а первый outbound — маршрут по умолчанию для трафика, не подошедшего ни под одно правило.
 
 Проверить что трафик идёт через WARP:
 ```bash

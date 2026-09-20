@@ -1,0 +1,5 @@
+{
+  "type": "field",
+  "outboundTag": "direct",
+  "network": "tcp,udp"
+}
