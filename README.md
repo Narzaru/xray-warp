@@ -85,7 +85,9 @@ apt-get install -y docker.io docker-compose-v2 gettext-base
 │   │   └── config.yaml          # шаблон конфига Hysteria2 (пароль из .env)
 │   └── xray/
 │       ├── outbound-warp.json   # шаблон outbound через Cloudflare WARP
-│       └── outbound-vps.json    # шаблон outbound через exit VPS (VLESS)
+│       ├── outbound-vps.json    # шаблон outbound через exit VPS (VLESS)
+│       ├── routing-warp.json    # правило маршрутизации в warp-out
+│       └── routing-vps.json     # правило маршрутизации в vps-out
 └── html/
     └── index.html               # фейковый корпоративный сайт
 ```
@@ -348,7 +350,17 @@ nsenter -t "$PID" -n ss -tin state established "( sport = :443 )"
 
 По умолчанию XRay выходит в интернет напрямую с IP вашего VPS. Для смены выходного IP настройте `PROXY_MODE` в `.env` до запуска скрипта.
 
-> **Как работают файлы `config/xray/`**: `outbound-warp.json` и `outbound-vps.json` — это шаблоны. Скрипт не монтирует их в контейнер автоматически. При запуске он выводит готовый JSON в терминал — его нужно скопировать и вставить в панели вручную: **Settings → Xray Configs → Custom Config → Restart XRay**. Без этого шага XRay выходит в интернет напрямую независимо от `PROXY_MODE`.
+> **Как работают файлы `config/xray/`**: это шаблоны, скрипт не монтирует их в контейнер автоматически. При запуске он выводит готовый JSON в терминал — его нужно вставить в панели вручную. Вставок две: `outbound-*.json` в **Settings → Xray Configs → Custom Config**, а `routing-*.json` — отдельным правилом в **Routing Rules**. Без этого XRay выходит в интернет напрямую независимо от `PROXY_MODE`.
+>
+> **Почему правило отдельно.** Раньше оба куска лежали в одном файле, и блок `routing` вставлялся вместе с outbound. На 3x-ui 26.9.x панель кладёт такой блок целиком внутрь `routing.rules` — как одно правило, у которого нет `outboundTag`. XRay отказывается читать конфиг и уходит в цикл перезапуска:
+>
+> ```
+> Failure in running xray-core: exit status 23
+> failed to build routing configuration > invalid field rule >
+> neither outboundTag nor balancerTag is specified in routing rule
+> ```
+>
+> Правило должно лежать в `routing.rules` плоско, поэтому оно и вынесено в отдельный файл.
 
 ### PROXY_MODE=warp — через Cloudflare WARP
 
@@ -360,7 +372,7 @@ PROXY_MODE=warp
 
 Скрипт запустит отдельный `warp`-контейнер и выведет JSON-конфиг. После установки в панели нужно:
 
-**Settings → Xray Configs → Custom Config** — вставить весь JSON из вывода скрипта (или из `config/xray/outbound-warp.json`):
+1. **Settings → Xray Configs → Custom Config** — вставить outbound (`config/xray/outbound-warp.json`):
 
 ```json
 {
@@ -372,21 +384,21 @@ PROXY_MODE=warp
         "servers": [{"address": "warp", "port": 1080}]
       }
     }
-  ],
-  "routing": {
-    "domainStrategy": "IPIfNonMatch",
-    "rules": [
-      {
-        "type": "field",
-        "outboundTag": "warp-out",
-        "network": "tcp,udp"
-      }
-    ]
-  }
+  ]
 }
 ```
 
-Сохранить → **Restart XRay**.
+2. **Settings → Xray Configs → Routing Rules** — добавить правило (`config/xray/routing-warp.json`):
+
+```json
+{
+  "type": "field",
+  "outboundTag": "warp-out",
+  "network": "tcp,udp"
+}
+```
+
+Сохранить → **Restart XRay**. Правило должно оказаться отдельным элементом `routing.rules` — вложенный блок `routing` роняет XRay, см. врезку выше.
 
 Проверить что трафик идёт через WARP:
 ```bash
@@ -406,7 +418,7 @@ VPS_UUID=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
 VPS_SNI=yourexit.domain.com
 ```
 
-Скрипт сгенерирует файл `outbound-config.json` и выведет его содержимое — вставить в **Settings → Xray Configs → Custom Config** и нажать Restart XRay.
+Скрипт сгенерирует файл `outbound-config.json` и выведет его содержимое — вставить в **Settings → Xray Configs → Custom Config**, а правило из `config/xray/routing-vps.json` добавить в **Routing Rules** отдельным элементом. Затем Restart XRay.
 
 ## Hysteria2 — транспорт для каналов с потерями
 

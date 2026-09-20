@@ -17,6 +17,12 @@ services:
     cap_add:
       - NET_ADMIN
       - SYS_MODULE
+    environment:
+      # С версии образа от 2026 MicroWARP отказывается стартовать без
+      # SOCKS_USER/SOCKS_PASS. Порт 1080 не публикуется на хост и доступен
+      # только внутри xray-net, поэтому анонимный режим разрешён явно —
+      # иначе учётные данные пришлось бы дублировать в outbound-warp.json.
+      - ALLOW_NO_AUTH=1
     sysctls:
       - net.ipv4.conf.all.src_valid_mark=1
     volumes:

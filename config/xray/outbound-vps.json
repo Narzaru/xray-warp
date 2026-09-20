@@ -26,15 +26,5 @@
         }
       }
     }
-  ],
-  "routing": {
-    "domainStrategy": "IPIfNonMatch",
-    "rules": [
-      {
-        "type": "field",
-        "outboundTag": "vps-out",
-        "network": "tcp,udp"
-      }
-    ]
-  }
+  ]
 }

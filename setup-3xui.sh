@@ -151,9 +151,20 @@ step 2 "Создание директорий"
 mkdir -p certbot/{conf,www} \
          logs/{3x-ui,certbot}
 
-# Ограничение логов Docker глобально (покрывает временные контейнеры certbot/nginx-init)
+# Настройки демона Docker:
+#   * ограничение логов глобально (покрывает временные контейнеры certbot/nginx-init)
+#   * host-gateway-ip -- адрес хоста для extra_hosts: host.docker.internal.
+#     На Docker 29 автоопределение отдаёт "invalid IP", и sslh не может
+#     резолвить host.docker.internal -- форвардинг SSH с 443 ломается.
 _daemon_cfg=/etc/docker/daemon.json
-if [ ! -f "$_daemon_cfg" ] || ! grep -q '"max-size"' "$_daemon_cfg"; then
+_host_gw=$(ip -4 -o addr show docker0 2>/dev/null | awk '{print $4}' | cut -d/ -f1)
+_host_gw="${_host_gw:-172.17.0.1}"
+
+_daemon_ok=1
+grep -q '"max-size"' "$_daemon_cfg" 2>/dev/null || _daemon_ok=0
+grep -q '"host-gateway-ip"' "$_daemon_cfg" 2>/dev/null || _daemon_ok=0
+
+if [ "$_daemon_ok" -eq 0 ]; then
     _tmp=$(mktemp)
     if [ -f "$_daemon_cfg" ] && [ -s "$_daemon_cfg" ]; then
         # Влить в существующий JSON
@@ -162,16 +173,23 @@ import json, sys
 d = json.load(open('$_daemon_cfg'))
 d.setdefault('log-driver','json-file')
 d.setdefault('log-opts',{}).update({'max-size':'10m','max-file':'3'})
+d.setdefault('host-gateway-ip','${_host_gw}')
 print(json.dumps(d, indent=2))
 " > "$_tmp"
     else
-        echo '{"log-driver":"json-file","log-opts":{"max-size":"10m","max-file":"3"}}' > "$_tmp"
+        python3 -c "
+import json
+print(json.dumps({'log-driver':'json-file',
+                  'log-opts':{'max-size':'10m','max-file':'3'},
+                  'host-gateway-ip':'${_host_gw}'}, indent=2))
+" > "$_tmp"
     fi
     mv "$_tmp" "$_daemon_cfg"
-    systemctl reload docker 2>/dev/null || true
-    ok "Docker log rotation настроен (10m × 3 файла)"
+    # host-gateway-ip читается только при старте демона -- reload его не подхватит.
+    systemctl restart docker 2>/dev/null || systemctl reload docker 2>/dev/null || true
+    ok "Docker: log rotation (10m x 3) + host-gateway-ip=${_host_gw}"
 else
-    ok "Docker log rotation уже настроен"
+    ok "Docker daemon.json уже настроен"
 fi
 
 chmod 700 certbot/conf
@@ -400,11 +418,18 @@ case "${PROXY_MODE}" in
     ok "WARP-контейнер запущен (поднят на шаге 5)"
 
     echo ""
-    echo -e "${YELLOW}Вставьте в панели: Настройки → XRay Configs → Custom Config:${NC}"
+    echo -e "${YELLOW}1. Настройки → XRay Configs → Custom Config — вставьте:${NC}"
     echo ""
     cat config/xray/outbound-warp.json
     echo ""
+    echo -e "${YELLOW}2. Настройки → XRay Configs → Routing Rules — добавьте правило:${NC}"
+    echo ""
+    cat config/xray/routing-warp.json
+    echo ""
     echo -e "${YELLOW}После сохранения нажмите «Restart XRay» в панели.${NC}"
+    echo -e "${YELLOW}Правило обязано лежать плоско в routing.rules: если вставить${NC}"
+    echo -e "${YELLOW}блок routing целиком в Custom Config, панель вложит его внутрь${NC}"
+    echo -e "${YELLOW}rules, и XRay не стартует (exit status 23).${NC}"
     ;;
 
   vps)
@@ -419,9 +444,13 @@ case "${PROXY_MODE}" in
     ok "Конфиг сгенерирован → outbound-config.json"
 
     echo ""
-    echo -e "${YELLOW}Вставьте в панели: Настройки → XRay Configs → Custom Config:${NC}"
+    echo -e "${YELLOW}1. Настройки → XRay Configs → Custom Config — вставьте:${NC}"
     echo ""
     cat outbound-config.json
+    echo ""
+    echo -e "${YELLOW}2. Настройки → XRay Configs → Routing Rules — добавьте правило:${NC}"
+    echo ""
+    cat config/xray/routing-vps.json
     echo ""
     echo -e "${YELLOW}После сохранения нажмите «Restart XRay» в панели.${NC}"
     ;;

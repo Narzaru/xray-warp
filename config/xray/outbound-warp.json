@@ -12,15 +12,5 @@
         ]
       }
     }
-  ],
-  "routing": {
-    "domainStrategy": "IPIfNonMatch",
-    "rules": [
-      {
-        "type": "field",
-        "outboundTag": "warp-out",
-        "network": "tcp,udp"
-      }
-    ]
-  }
+  ]
 }

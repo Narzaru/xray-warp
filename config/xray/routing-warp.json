@@ -1,0 +1,5 @@
+{
+  "type": "field",
+  "outboundTag": "warp-out",
+  "network": "tcp,udp"
+}
