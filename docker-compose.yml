@@ -11,12 +11,13 @@ services:
       - "host.docker.internal:host-gateway"
     ports:
       - "443:443"
+    # Конфиг — файлом, а не флагами: resolve_on_forward задаётся только в нём.
+    configs:
+      - source: sslh-cfg
+        target: /etc/sslh/sslh.cfg
     command:
       - --foreground
-      - --listen=0.0.0.0:443
-      - --ssh=host.docker.internal:${SSH_PORT:-22}
-      - --tls=caddy:8443
-      - --anyprot=caddy:8443
+      - --config=/etc/sslh/sslh.cfg
     # Congestion control живёт в сетевом namespace контейнера, а не на хосте:
     # без этого сокеты работают на cubic, который на канале с потерями режет
     # окно вдвое на каждую потерю. Внешнее TCP-соединение с клиентом
@@ -142,3 +143,18 @@ volumes:
   3x-ui-data:
   caddy-data:
   caddy-config:
+
+configs:
+  # Адреса бэкендов sslh по умолчанию резолвит один раз при старте. Когда
+  # автообновление образов пересоздаёт caddy, тот может получить новый IP,
+  # и sslh продолжает слать TLS по старому: SSH через 443 работает, VPN — нет.
+  # resolve_on_forward заставляет резолвить имя на каждом соединении.
+  sslh-cfg:
+    content: |
+      foreground: true;
+      listen: ( { host: "0.0.0.0"; port: "443"; } );
+      protocols: (
+        { name: "ssh";     host: "host.docker.internal"; port: "${SSH_PORT:-22}"; resolve_on_forward: true; },
+        { name: "tls";     host: "caddy"; port: "8443"; resolve_on_forward: true; },
+        { name: "anyprot"; host: "caddy"; port: "8443"; resolve_on_forward: true; }
+      );
