@@ -7,14 +7,16 @@ inbound: порт 10000 (внутренний) и security=none (TLS снима�
 XRay). Импортировать её как есть нельзя — клиент пойдёт не туда и не по TLS.
 
 Скрипт правит эти поля и на выходе даёт два варианта:
-  1. Исправленную vless://-ссылку — для быстрого импорта.
-  2. Полный JSON-конфиг с настроенным xmux — для мобильных сетей, где важно
-     разложить трафик по нескольким соединениям. Через ссылку xmux задать
-     нельзя: v2rayNG не разбирает параметр extra в URI.
+  1. Исправленную vless://-ссылку с xmux в параметре extra — основной вариант,
+     импортируется в любой клиент (v2rayNG, iOS-клиенты на Xray-core).
+     Клиенты, не знающие extra, просто игнорируют его.
+  2. Полный JSON-конфиг — когда нужен ещё и IP в dns.hosts (--ip), чтобы
+     убрать резолв домена из критического пути.
 
 Использование:
     python3 tools/xui-link.py '<ссылка из панели>'
     python3 tools/xui-link.py '<ссылка>' --mode packet-up --connections 2-4
+    python3 tools/xui-link.py '<ссылка>' --ip 203.0.113.10
     python3 tools/xui-link.py '<ссылка>' --link-only
 """
 
@@ -24,6 +26,14 @@ import sys
 from urllib.parse import parse_qs, quote, unquote, urlencode, urlparse
 
 PUBLIC_PORT = 443  # снаружи слушает sslh, а не XRay
+
+
+def build_extra(connections):
+    """Объект extra транспорта xhttp — общий для ссылки и JSON."""
+    return {
+        "xPaddingBytes": "100-1000",
+        "xmux": {"maxConnections": connections, "maxConcurrency": 0},
+    }
 
 
 def parse_link(link):
@@ -45,7 +55,7 @@ def parse_link(link):
     }
 
 
-def fix_params(src, mode):
+def fix_params(src, mode, connections):
     """Приводит параметры к тому, что реально ждёт клиент."""
     p = dict(src["params"])
     domain = src["address"]
@@ -59,6 +69,7 @@ def fix_params(src, mode):
     p["alpn"] = "h2"                  # stream-one требует HTTP/2
     p["fp"] = p.get("fp") or "firefox"
     p["mode"] = mode
+    p["extra"] = json.dumps(build_extra(connections), separators=(",", ":"))
 
     # Панель кладёт сюда пути к сертификатам и прочее, клиенту не нужное.
     for junk in ("flow", "headerType", "serviceName", "seed", "spx", "pbk", "sid"):
@@ -76,10 +87,7 @@ def build_link(src, params, mode):
 def build_config(src, params, mode, connections):
     domain = src["address"]
     xhttp = {
-        "extra": {
-            "xPaddingBytes": "100-1000",
-            "xmux": {"maxConnections": connections, "maxConcurrency": 0},
-        },
+        "extra": build_extra(connections),
         "host": params["host"],
         "mode": mode,
         "path": params["path"],
@@ -166,8 +174,10 @@ def main():
     ap.add_argument("--mode", default="stream-one",
                     choices=["stream-one", "stream-up", "packet-up", "auto"],
                     help="режим XHTTP (по умолчанию stream-one)")
-    ap.add_argument("--connections", default="4-8",
-                    help="xmux maxConnections, например 4-8 (по умолчанию 4-8)")
+    # Больше 3 одновременных рукопожатий к одному хосту ТСПУ замораживает
+    # на ~120 с (2026), поэтому по умолчанию держимся ниже порога.
+    ap.add_argument("--connections", default="2-3",
+                    help="xmux maxConnections, например 2-3 (по умолчанию 2-3)")
     ap.add_argument("--ip", default="",
                     help="IP сервера — пропишется в dns.hosts, чтобы убрать "
                          "резолв из критического пути")
@@ -176,9 +186,9 @@ def main():
 
     raw = args.link or sys.stdin.read()
     src = parse_link(raw)
-    params = fix_params(src, args.mode)
+    params = fix_params(src, args.mode, args.connections)
 
-    print("── Исправленная ссылка ──────────────────────────────────────────")
+    print("── Исправленная ссылка (с xmux) ─────────────────────────────────")
     print(build_link(src, params, args.mode))
     print()
 
@@ -191,11 +201,9 @@ def main():
     else:
         cfg["dns"].pop("hosts")
 
-    print("── Конфиг с xmux (v2rayNG → Custom Config) ──────────────────────")
+    print("── JSON-конфиг (v2rayNG → Custom Config) ────────────────────────")
     print(json.dumps(cfg, ensure_ascii=False, indent=2))
     print()
-    print("Ссылка не переносит xmux — для мобильных сетей импортируйте JSON.",
-          file=sys.stderr)
 
 
 if __name__ == "__main__":
