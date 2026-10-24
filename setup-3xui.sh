@@ -19,6 +19,24 @@
 set -euo pipefail
 IFS=$'\n\t'
 
+# ── Отвязка от терминала ────────────────────────────────────────────────────
+# SSH-сессия через 443 идёт сквозь sslh, а скрипт сам его перезапускает: шаг 2
+# рестартует dockerd, шаг 5 пересоздаёт контейнеры. Обрыв сессии убивал скрипт
+# на середине — в худшем случае новый sslh оставался в состоянии created, и SSH
+# через 443 пропадал совсем. Поэтому скрипт перезапускает себя в отдельной
+# сессии, а в терминале только показывает лог: обрыв SSH убьёт tail, не установку.
+if [ -z "${XUI_DETACHED:-}" ] && [ -t 1 ]; then
+    _log="$(pwd)/setup.log"
+    XUI_DETACHED=1 setsid nohup bash "$0" "$@" > "$_log" 2>&1 < /dev/null &
+    _pid=$!
+    echo "Установка идёт в фоне (PID ${_pid}), лог: ${_log}"
+    echo "Если SSH оборвётся — переподключитесь и смотрите: tail -f ${_log}"
+    echo ""
+    tail -n +1 -f --pid="$_pid" "$_log"
+    wait "$_pid"   # код выхода установки; при set -e ошибка уходит наружу
+    exit 0
+fi
+
 # ── Вывод ───────────────────────────────────────────────────────────────────
 
 GREEN='\033[0;32m'; BLUE='\033[0;34m'; YELLOW='\033[1;33m'
@@ -32,12 +50,12 @@ die()  { fail "$1"; exit 1; }
 
 # ── Баннер ──────────────────────────────────────────────────────────────────
 
-clear
+clear 2>/dev/null || true   # без TERM clear падает, а set -e завершил бы скрипт
 echo -e "${MAGENTA}"
 cat << "BANNER"
 ╔════════════════════════════════════════════════════════╗
-║       3x-ui · XRay · Nginx · sslh — Docker Setup      ║
-║                   Ubuntu 24 Edition                    ║
+║       3x-ui · XRay · Caddy · sslh — Docker Setup       ║
+║                  Ubuntu 24.04 / 26.04                  ║
 ╚════════════════════════════════════════════════════════╝
 BANNER
 echo -e "${NC}"
@@ -53,6 +71,10 @@ if [ ! -f .env ]; then
     echo -e "  ${BLUE}nano .env${NC}"
     exit 0
 fi
+
+# .env, скопированный с Windows, приходит с CRLF: значения получают хвостовой \r
+# (DOMAIN=example.com\r), и certbot, envsubst и compose ломаются невнятно.
+sed -i 's/\r$//' .env
 
 # shellcheck source=/dev/null
 source .env
@@ -72,6 +94,11 @@ export DOMAIN TIMEZONE SSH_PORT PROXY_MODE
 
 # Hysteria2 — опциональный транспорт QUIC/UDP (docker-compose.hysteria.yml).
 HYSTERIA="${HYSTERIA:-off}"
+
+# Проверить сразу: опечатка вроде PROXY_MODE=Warp иначе всплывала только на
+# шаге 8 — после того как стек уже поднят без warp и записан cron.
+case "$PROXY_MODE" in off|warp|vps) ;; *) die "Неизвестный PROXY_MODE=${PROXY_MODE} (допустимо: off, warp, vps)" ;; esac
+case "$HYSTERIA"   in off|on) ;;       *) die "Неизвестный HYSTERIA=${HYSTERIA} (допустимо: off, on)" ;; esac
 
 # Список compose-файлов собирается один раз и используется везде: при запуске,
 # в cron и в итоговой справке. Иначе --remove-orphans снесёт контейнеры,
@@ -99,6 +126,11 @@ step 1 "Проверка зависимостей"
 
 command -v docker &>/dev/null || die "Docker не найден → https://docs.docker.com/engine/install/ubuntu/"
 command -v envsubst &>/dev/null || die "envsubst не найден → sudo apt-get install -y gettext-base"
+command -v python3 &>/dev/null || die "python3 не найден → sudo apt-get install -y python3"
+command -v curl &>/dev/null || die "curl не найден → sudo apt-get install -y curl"
+# `docker compose version` работает и без демона, поэтому проверяем его отдельно:
+# иначе скрипт молча умирал на шаге 2 при чтении адреса docker0.
+docker info &>/dev/null || die "Демон Docker не запущен → systemctl enable --now docker"
 
 # Поддержка docker-compose v1 (docker-compose) и v2 (docker compose).
 # v2 проверяется первым: v1.29.2 несовместим с Docker Engine 25+ (KeyError: ContainerConfig).
@@ -157,40 +189,61 @@ mkdir -p certbot/{conf,www} \
 #     На Docker 29 автоопределение отдаёт "invalid IP", и sslh не может
 #     резолвить host.docker.internal -- форвардинг SSH с 443 ломается.
 _daemon_cfg=/etc/docker/daemon.json
-_host_gw=$(ip -4 -o addr show docker0 2>/dev/null | awk '{print $4}' | cut -d/ -f1)
-_host_gw="${_host_gw:-172.17.0.1}"
+# || true: без docker0 ip завершается с ошибкой, и pipefail + set -e молча
+# оборвали бы скрипт. Подставлять дефолт 172.17.0.1 тоже нельзя — без docker0
+# он заведомо неверен, и SSH через 443 сломается уже после установки.
+_host_gw=$(ip -4 -o addr show docker0 2>/dev/null | awk '{print $4}' | cut -d/ -f1 || true)
+[ -n "$_host_gw" ] || die "Не найден IPv4-адрес интерфейса docker0 (\"bridge\": \"none\" в ${_daemon_cfg}?)"
 
-_daemon_ok=1
-grep -q '"max-size"' "$_daemon_cfg" 2>/dev/null || _daemon_ok=0
-grep -q '"host-gateway-ip"' "$_daemon_cfg" 2>/dev/null || _daemon_ok=0
-
-if [ "$_daemon_ok" -eq 0 ]; then
-    _tmp=$(mktemp)
-    if [ -f "$_daemon_cfg" ] && [ -s "$_daemon_cfg" ]; then
-        # Влить в существующий JSON
-        python3 -c "
-import json, sys
-d = json.load(open('$_daemon_cfg'))
-d.setdefault('log-driver','json-file')
-d.setdefault('log-opts',{}).update({'max-size':'10m','max-file':'3'})
-d.setdefault('host-gateway-ip','${_host_gw}')
+# Python отвечает 0, если менять нечего, 10 — если нужен рестарт демона.
+# host-gateway-ips (Docker 28+) равнозначен host-gateway-ip: второй не добавляем.
+# log-opts max-size понимают только json-file и local — с journald/syslog
+# dockerd с такой опцией не стартует.
+_tmp=$(mktemp)
+_daemon_rc=0
+python3 - "$_daemon_cfg" "$_host_gw" > "$_tmp" << 'PY' || _daemon_rc=$?
+import json, os, sys
+path, gw = sys.argv[1], sys.argv[2]
+d = {}
+if os.path.exists(path) and os.path.getsize(path) > 0:
+    d = json.load(open(path))
+before = json.dumps(d, sort_keys=True)
+d.setdefault('log-driver', 'json-file')
+if d['log-driver'] in ('json-file', 'local'):
+    opts = d.setdefault('log-opts', {})
+    opts.setdefault('max-size', '10m')
+    opts.setdefault('max-file', '3')
+if 'host-gateway-ip' not in d and 'host-gateway-ips' not in d:
+    d['host-gateway-ip'] = gw
 print(json.dumps(d, indent=2))
-" > "$_tmp"
-    else
-        python3 -c "
-import json
-print(json.dumps({'log-driver':'json-file',
-                  'log-opts':{'max-size':'10m','max-file':'3'},
-                  'host-gateway-ip':'${_host_gw}'}, indent=2))
-" > "$_tmp"
-    fi
-    mv "$_tmp" "$_daemon_cfg"
-    # host-gateway-ip читается только при старте демона -- reload его не подхватит.
-    systemctl restart docker 2>/dev/null || systemctl reload docker 2>/dev/null || true
-    ok "Docker: log rotation (10m x 3) + host-gateway-ip=${_host_gw}"
-else
+sys.exit(10 if json.dumps(d, sort_keys=True) != before else 0)
+PY
+
+case "$_daemon_rc" in
+  0)
+    rm -f "$_tmp"
     ok "Docker daemon.json уже настроен"
-fi
+    ;;
+  10)
+    [ -f "$_daemon_cfg" ] && cp "$_daemon_cfg" "${_daemon_cfg}.bak"
+    mv "$_tmp" "$_daemon_cfg"
+    # host-gateway-ip читается только при старте демона — reload его не подхватит.
+    if ! systemctl restart docker || ! docker info &>/dev/null; then
+        fail "Docker не поднялся с новым ${_daemon_cfg}"
+        if [ -f "${_daemon_cfg}.bak" ]; then
+            mv "${_daemon_cfg}.bak" "$_daemon_cfg"
+            systemctl restart docker || true
+            die "Возвращён прежний ${_daemon_cfg}. Причина: journalctl -u docker -n 30"
+        fi
+        die "Причина: journalctl -u docker -n 30"
+    fi
+    ok "Docker: log rotation + host-gateway-ip=${_host_gw} (прежний конфиг: ${_daemon_cfg}.bak)"
+    ;;
+  *)
+    rm -f "$_tmp"
+    die "Не удалось разобрать ${_daemon_cfg} — проверьте, что это валидный JSON"
+    ;;
+esac
 
 chmod 700 certbot/conf
 chmod 755 certbot/www logs logs/3x-ui logs/certbot
@@ -207,6 +260,12 @@ ok "Директории готовы"
 # Важно: sysctl хоста НЕ распространяется на контейнеры — у каждого свой сетевой
 # namespace. Congestion control контейнеров задан в docker-compose.yml (sysctls:),
 # и это критично для sslh, который терминирует внешнее TCP-соединение клиента.
+# Без BBR в ядре стек не поднимется вовсе: sysctls: в docker-compose.yml у sslh,
+# caddy и 3x-ui падают с invalid argument. Лучше остановиться здесь, до запуска.
+modprobe tcp_bbr 2>/dev/null || true
+grep -qw bbr /proc/sys/net/ipv4/tcp_available_congestion_control \
+    || die "В ядре нет BBR (tcp_available_congestion_control: $(cat /proc/sys/net/ipv4/tcp_available_congestion_control)). На LXC/OpenVZ уберите sysctls из docker-compose.yml."
+
 _sysctl_cfg=/etc/sysctl.d/99-vpn-tuning.conf
 cat > "$_sysctl_cfg" << 'SYSCTL'
 net.core.default_qdisc = fq
@@ -266,29 +325,84 @@ fi
 
 step 4 "SSL-сертификат"
 
+# ── DNS: A и AAAA должны вести на этот сервер ───────────────────────────────
+# Let's Encrypt при наличии AAAA проверяет домен сначала по IPv6 и на IPv4 не
+# откатывается, если по IPv6 ответил чужой сервер. AAAA, оставшаяся от старого
+# хоста, даёт невнятный отказ certbot, а после установки уводит IPv6-клиентов
+# не туда. Записи берём из публичного DNS (DoH), а не через getent: тот читает
+# /etc/hosts, где cloud-init нередко прописывает домен как 127.0.1.1, а для
+# AAAA при её отсутствии возвращает v4-mapped адрес ::ffff:x.x.x.x.
+dns_records() {   # $1 = A | AAAA
+    curl -fsS -m 10 "https://dns.google/resolve?name=${DOMAIN}&type=$1" 2>/dev/null \
+        | python3 -c "
+import json, sys
+t = {'A': 1, 'AAAA': 28}['$1']
+for a in json.load(sys.stdin).get('Answer', []):
+    if a.get('type') == t: print(a['data'])
+" 2>/dev/null || true
+}
+
+SERVER_IP4=$(curl -4 -fsS -m 10 https://api.ipify.org 2>/dev/null || true)
+_dns_a=$(dns_records A)
+_dns_aaaa=$(dns_records AAAA)
+_local_v6=$(ip -6 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 || true)
+
+_dns_err=""
+if [ -z "$_dns_a" ]; then
+    _dns_err="у ${DOMAIN} нет A-записи (или DoH недоступен)"
+elif [ -n "$SERVER_IP4" ] && ! grep -qxF "$SERVER_IP4" <<< "$_dns_a"; then
+    _dns_err="A-запись ${DOMAIN} → $(echo $_dns_a), а IPv4 сервера ${SERVER_IP4}"
+fi
+while read -r _aaaa; do
+    [ -n "$_aaaa" ] || continue
+    if ! grep -qxF "$_aaaa" <<< "$_local_v6"; then
+        _dns_err="${_dns_err:+${_dns_err}; }AAAA-запись ${DOMAIN} → ${_aaaa}, но такого IPv6 на сервере нет. Удалите AAAA или пропишите адрес из: ip -6 addr show scope global"
+    fi
+done <<< "$_dns_aaaa"
+
+[ -n "$_dns_a" ] && ok "A:    $(echo $_dns_a)"
+[ -n "$_dns_aaaa" ] && ok "AAAA: $(echo $_dns_aaaa)"
+
 CERT="certbot/conf/live/${DOMAIN}/fullchain.pem"
+
+if [ -n "$_dns_err" ]; then
+    # С готовым сертификатом это не блокер, но клиентов собьёт с толку.
+    # SKIP_DNS_CHECK=1 — для DNS за прокси/GeoDNS, где проверка заведомо врёт.
+    if [ -f "$CERT" ] || [ "${SKIP_DNS_CHECK:-0}" = "1" ]; then
+        fail "DNS: ${_dns_err}"
+    else
+        die "DNS: ${_dns_err}. Проверку можно отключить: SKIP_DNS_CHECK=1 ./setup-3xui.sh"
+    fi
+fi
 
 if [ -f "$CERT" ]; then
     ok "Сертификат уже существует, пропускаем"
 else
-    # Запустить временный nginx только с HTTP (без SSL-блоков — сертификата ещё нет)
-    echo "  Запуск временного nginx для webroot..."
-    docker stop nginx-certbot-init 2>/dev/null || true
-    if ! docker run -d --rm --name nginx-certbot-init \
-        -p 80:80 \
-        -v "$(pwd)/nginx-init.conf:/etc/nginx/conf.d/default.conf:ro" \
-        -v "$(pwd)/certbot/www:/var/www/certbot" \
-        nginx:alpine; then
-        die "Не удалось запустить nginx на порту 80. Проверьте: ss -tlnp | grep :80"
-    fi
+    # Порт 80 для ACME-challenge. Если стек уже работает (повторный запуск со
+    # сменой DOMAIN), его держит Caddy и сам отдаёт /.well-known/acme-challenge
+    # из certbot/www — временный nginx тогда не нужен и не смог бы занять порт.
+    if [ "$(docker inspect -f '{{.State.Running}}' caddy 2>/dev/null || echo false)" = "true" ]; then
+        ok "Порт 80 обслуживает запущенный Caddy"
+    else
+        # Временный nginx только с HTTP (без SSL-блоков — сертификата ещё нет)
+        echo "  Запуск временного nginx для webroot..."
+        docker stop nginx-certbot-init 2>/dev/null || true
+        if ! docker run -d --rm --name nginx-certbot-init \
+            -p 80:80 \
+            -v "$(pwd)/nginx-init.conf:/etc/nginx/conf.d/default.conf:ro" \
+            -v "$(pwd)/certbot/www:/var/www/certbot" \
+            nginx:alpine; then
+            die "Не удалось запустить nginx на порту 80. Проверьте: ss -tlnp | grep :80"
+        fi
 
-    # Подождать, пока nginx полностью поднимется (bash /dev/tcp — без внешних зависимостей)
-    _retries=10
-    until bash -c 'echo >/dev/tcp/localhost/80' 2>/dev/null || [ $_retries -eq 0 ]; do
-        sleep 1; _retries=$((_retries - 1))
-    done
-    [ $_retries -gt 0 ] || { docker stop nginx-certbot-init 2>/dev/null || true; die "nginx не ответил на порту 80 за 10 секунд. Проверьте: ss -tlnp | grep :80"; }
-    ok "nginx слушает порт 80"
+        # Подождать, пока nginx полностью поднимется (bash /dev/tcp — без внешних зависимостей)
+        _retries=10
+        until bash -c 'echo >/dev/tcp/localhost/80' 2>/dev/null || [ $_retries -eq 0 ]; do
+            sleep 1; _retries=$((_retries - 1))
+        done
+        [ $_retries -gt 0 ] || { docker stop nginx-certbot-init 2>/dev/null || true; die "nginx не ответил на порту 80 за 10 секунд. Проверьте: ss -tlnp | grep :80"; }
+        ok "nginx слушает порт 80"
+    fi
 
     echo "  Запрос сертификата для: ${DOMAIN}"
 
@@ -308,8 +422,8 @@ else
         fail "Не удалось получить сертификат"
         echo ""
         echo -e "${YELLOW}Проверьте:${NC}"
-        echo "  • DNS: ${DOMAIN} → IP этого сервера"
-        echo "  • Firewall: ufw allow 80/tcp && ufw allow 443/tcp"
+        echo "  • DNS: A (и AAAA, если есть) ${DOMAIN} → этот сервер"
+        echo "  • Firewall хостера и ufw: открыт 80/tcp"
         echo "  • Порт 80 не занят другим процессом: ss -tlnp | grep :80"
         exit 1
     fi
@@ -356,32 +470,75 @@ step 6 "Проверка состояния"
 sleep 5
 "${DC[@]}" ps
 
+# Caddyfile смонтирован файлом, и up -d не пересоздаёт caddy, если изменился
+# только он: при повторном запуске Caddy остался бы со старым конфигом.
+# --force — потому что без него reload с неизменным конфигом ничего не делает,
+# а сертификат для нового DOMAIN тоже нужно подхватить.
+docker exec caddy caddy reload --force --config /etc/caddy/Caddyfile >/dev/null 2>&1 \
+    && ok "Caddy перечитал Caddyfile" \
+    || fail "caddy reload не прошёл: docker logs caddy --tail 20"
+
+# Статус running сам по себе ничего не гарантирует: контейнер в цикле падений
+# в момент проверки тоже running, а sslh может работать, но не пересылать SSH
+# (так было с host.docker.internal на Docker 29). Поэтому смотрим, не растёт
+# ли счётчик рестартов, и проверяем реальный путь через 443. Счётчик сравниваем
+# во времени, а не с нулём: у давно работающего контейнера он бывает ненулевым.
 _failed=0
-for _svc in sslh caddy 3x-ui; do
+_svcs=(sslh caddy 3x-ui)
+declare -A _restarts
+for _svc in "${_svcs[@]}"; do
+    _restarts[$_svc]=$(docker inspect --format='{{.RestartCount}}' "$_svc" 2>/dev/null || echo 0)
+done
+sleep 10
+for _svc in "${_svcs[@]}"; do
     _state=$(docker inspect --format='{{.State.Status}}' "$_svc" 2>/dev/null || echo "missing")
-    if [ "$_state" = "running" ]; then
+    _now=$(docker inspect --format='{{.RestartCount}}' "$_svc" 2>/dev/null || echo 0)
+    if [ "$_state" = "running" ] && [ "$_now" = "${_restarts[$_svc]}" ]; then
         ok "$_svc — running"
     else
-        fail "$_svc — ${_state}"
+        fail "$_svc — ${_state}, перезапусков за 10 с: $((_now - _restarts[$_svc]))"
         docker logs --tail 15 "$_svc" 2>&1 | sed 's/^/    /' >&2
         _failed=1
     fi
 done
-[ $_failed -eq 0 ] || die "Один или несколько контейнеров не запущены. Проверьте логи выше."
+
+# SSH через 443: клиент молчит, sslh по таймауту отдаёт соединение в ssh,
+# и должен прийти баннер sshd.
+_banner=$(timeout 15 bash -c 'exec 3<>/dev/tcp/127.0.0.1/443; head -c 4 <&3' 2>/dev/null || true)
+if [ "$_banner" = "SSH-" ]; then
+    ok "SSH через 443 отвечает"
+else
+    fail "SSH через 443 не отвечает — не закрывайте порт ${SSH_PORT}. Логи: docker logs sslh --tail 20"
+    _failed=1
+fi
+
+# TLS через 443: sslh → Caddy, сертификат валиден для DOMAIN, сайт отдаёт 200.
+_code=$(curl -sS -o /dev/null -w '%{http_code}' -m 15 \
+        --resolve "${DOMAIN}:443:127.0.0.1" "https://${DOMAIN}/" 2>/dev/null || true)
+if [ "$_code" = "200" ]; then
+    ok "HTTPS через 443: сайт отвечает, сертификат валиден"
+else
+    fail "HTTPS через 443: ответ '${_code:-нет}'. Проверьте: curl -v --resolve ${DOMAIN}:443:127.0.0.1 https://${DOMAIN}/"
+    _failed=1
+fi
+
+[ $_failed -eq 0 ] || die "Стек поднят с ошибками. Проверьте логи выше."
 
 # ════════════════════════════════════════════════════════════════════════════
-# ШАГ 7 — Cron: перезапуск XRay после обновления сертификатов
+# ШАГ 7 — Cron: подхват обновлённого сертификата и обновление образов
 # ════════════════════════════════════════════════════════════════════════════
 
-step 7 "Настройка перезапуска XRay после renewal"
+step 7 "Cron: перечитывание сертификата и обновление образов"
 
 CRON_FILE="/etc/cron.d/xray-cert-reload"
 _PROJECT_DIR="$(pwd)"
 _DC_UP="$(IFS=' '; echo "${DC[*]} ${COMPOSE_FILES[*]}")"
 
 # Сертификат читает Caddy (он терминирует TLS), а не XRay — у XRay security: none.
-# caddy reload перечитывает сертификат без разрыва соединений.
-_CERT_RELOAD='docker exec caddy caddy reload --config /etc/caddy/Caddyfile'
+# --force обязателен: Caddyfile после продления тот же, и без него Caddy пишет
+# «config is unchanged» и продолжает отдавать старый сертификат до истечения.
+# reload перечитывает сертификат без разрыва соединений.
+_CERT_RELOAD='docker exec caddy caddy reload --force --config /etc/caddy/Caddyfile'
 if [ "$HYSTERIA" = "on" ]; then
     # Hysteria2 читает сертификат при старте, поэтому её нужно перезапустить.
     _CERT_RELOAD="${_CERT_RELOAD} && docker restart hysteria"
@@ -390,6 +547,9 @@ fi
 cat > "$CRON_FILE" << CRON
 SHELL=/bin/bash
 PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
+# compose из cron видит только .env, а TIMEZONE скрипт мог взять из системы:
+# без этой строки недельное обновление пересоздавало бы 3x-ui с UTC.
+TIMEZONE=${TIMEZONE}
 
 # Certbot обновляет сертификат за 30 дней до истечения; ежесуточной перезагрузки достаточно.
 # Запуск в 4:00 ночи — минимум активных соединений.
@@ -506,8 +666,9 @@ echo -e "  Затем открыть: ${BLUE}http://localhost:2053${NC}"
 echo -e "  Логин: ${YELLOW}admin${NC}   Пароль: ${YELLOW}admin${NC}  ${RED}← сразу смените!${NC}"
 
 echo ""
-# IP сервера — для подсказки по dns.hosts в клиентском конфиге
-DOMAIN_IP=$(getent hosts "${DOMAIN}" 2>/dev/null | awk '{print $1; exit}')
+# IPv4 сервера — для подсказки по dns.hosts в клиентском конфиге. Не getent:
+# он вернул бы AAAA или 127.0.1.1 из /etc/hosts, а нужен именно внешний IPv4.
+DOMAIN_IP="${SERVER_IP4:-$(head -1 <<< "$_dns_a")}"
 [ -n "$DOMAIN_IP" ] || DOMAIN_IP="<ip сервера>"
 
 echo -e "${GREEN}Настройка XRay Inbound в панели:${NC}"
@@ -527,6 +688,12 @@ echo -e "  ${YELLOW}порт 10000 и security=none. Приведите её к 
 echo "    python3 tools/xui-link.py '<ссылка из панели>'"
 echo "  Ссылка уже содержит xmux (параметр extra). JSON нужен, только если"
 echo "  хотите прописать IP в dns.hosts: --ip ${DOMAIN_IP}"
+echo ""
+# Docker-сеть стека без IPv6: XRay не может открыть соединение на IPv6-адрес.
+# Клиент с IPv6 в TUN шлёт такие адреса в туннель, а приложение не откатывается
+# на IPv4, потому что TUN уже принял соединение локально, — сайты висят.
+echo -e "  ${YELLOW}В клиенте выключите IPv6 (v2rayNG: «Enable IPv6» — выкл.):${NC}"
+echo -e "  ${YELLOW}выход в интернет у сервера только по IPv4.${NC}"
 echo ""
 echo -e "${GREEN}Вариант B — TCP/RAW (проще, но хуже обходит блокировки):${NC}"
 echo "  Transmission: TCP (RAW)"
@@ -556,7 +723,7 @@ if [ "$HYSTERIA" = "on" ]; then
     echo ""
     echo -e "  ${YELLOW}В клиенте задайте полосу (Upload/Download Mbps) чуть ниже реальной${NC}"
     echo -e "  ${YELLOW}скорости канала — иначе не включится Brutal и смысл транспорта теряется.${NC}"
-    echo -e "  ${YELLOW}Если на сервере нет IPv6 — выставьте в клиенте IPv6 Mode = Disable.${NC}"
+    echo -e "  ${YELLOW}Выставьте в клиенте IPv6 Mode = Disable: выход у сервера только по IPv4.${NC}"
 fi
 _dc=$(IFS=" "; echo "${DC[*]} ${COMPOSE_FILES[*]}")
 echo -e "${GREEN}Полезные команды:${NC}"

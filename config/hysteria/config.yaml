@@ -16,12 +16,12 @@ auth:
   type: password
   password: ${HYSTERIA_PASSWORD}
 
-# Маскировка: на посторонние запросы отдаём фейковый сайт с nginx.
+# Маскировка: на посторонние запросы отдаём фейковый сайт с Caddy.
 # Пробинг снаружи видит обычный веб-сервер, а не прокси.
 masquerade:
   type: proxy
   proxy:
-    url: http://nginx:8080/
+    url: http://caddy:8080/
     rewriteHost: true
 
 # Окна QUIC увеличены под канал с высоким RTT (мобильный интернет: 100-300 мс).
