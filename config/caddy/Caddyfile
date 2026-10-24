@@ -19,6 +19,19 @@
     # loopback внутри контейнера и на хост не публикуется.
     admin localhost:2019
 
+    # С 2.11 Caddy обрывает запрос, по которому минуту не идут данные
+    # (защита от slowloris: read_body_idle и write_idle по 1m). Для xhttp
+    # это смертельно: тело запроса stream-one — весь аплинк туннеля, и
+    # пока клиент молча ждёт ответ (SSE у LLM, буфер видео), туннель рвётся
+    # ровно на 60-й секунде. Ноль означает «взять дефолт», поэтому значение
+    # задано явно и совпадает с connIdle XRay (config/xray/policy.json).
+    servers {
+        timeouts {
+            read_body_idle 30m
+            write_idle 30m
+        }
+    }
+
     log {
         output stdout
         format console

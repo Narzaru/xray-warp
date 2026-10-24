@@ -408,6 +408,15 @@ ok "Создан $CRON_FILE"
 
 step 8 "Исходящий прокси (PROXY_MODE=${PROXY_MODE})"
 
+# connIdle по умолчанию 300 с: XRay рвёт соединение, по которому 5 минут не
+# шло ни байта. Стриминговые API (LLM, SSE) молчат дольше, пока генерируют
+# большой ответ, и обрываются на середине. Нужно при любом PROXY_MODE.
+echo ""
+echo -e "${YELLOW}0. Настройки → XRay Configs → Advanced — замените блок policy на:${NC}"
+echo ""
+cat config/xray/policy.json
+echo ""
+
 case "${PROXY_MODE}" in
 
   off)
