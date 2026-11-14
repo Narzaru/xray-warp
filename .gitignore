@@ -17,6 +17,9 @@ pending-youtube-cache-exception.json
 /backups/
 __pycache__/
 
+# Local diagnostic reports
+/docs/diagnostics-*.md
+
 # Credentials and operator exports
 .ssh/
 .wg/

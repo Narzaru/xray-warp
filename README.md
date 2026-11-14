@@ -20,4 +20,4 @@ VLESS/XHTTP и SSH используют один публичный TCP-порт
 | Выбрать WARP, прямой выход или второй VPS; проверить порядок правил | [Исходящий трафик](docs/outbound.md) |
 | Подключить отдельный QUIC-вход | [Hysteria2](docs/hysteria.md) |
 | Обслуживать стек, образы и базы | [Эксплуатация](docs/operations.md) |
-| Разобрать обрыв или зависание | [По симптомам](docs/troubleshooting.md) · [TCP, IPv6 и таймауты](docs/network.md) · [Архив диагностики](docs/diagnostics-2026-11-04-youtube.md) |
+| Разобрать обрыв или зависание | [По симптомам](docs/troubleshooting.md) · [TCP, IPv6 и таймауты](docs/network.md) |
