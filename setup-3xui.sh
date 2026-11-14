@@ -10,7 +10,7 @@
 #
 #   Интернет :443/udp → [hysteria]  (опционально, HYSTERIA=on в .env)
 #
-# Зависимости: docker, docker-compose, envsubst (пакет gettext-base)
+# Зависимости Linux-хоста перечислены в docs/install.md.
 #
 # Использование:
 #   cp .env.example .env && nano .env
@@ -18,6 +18,9 @@
 
 set -euo pipefail
 IFS=$'\n\t'
+# Resolve templates and relative volumes from the checkout, even with an absolute invocation.
+cd -- "$(dirname -- "${BASH_SOURCE[0]}")"
+source ./tools/setup-network.sh
 
 # ── Отвязка от терминала ────────────────────────────────────────────────────
 # SSH-сессия через 443 идёт сквозь sslh, а скрипт сам его перезапускает: шаг 2
@@ -27,7 +30,8 @@ IFS=$'\n\t'
 # сессии, а в терминале только показывает лог: обрыв SSH убьёт tail, не установку.
 if [ -z "${XUI_DETACHED:-}" ] && [ -t 1 ]; then
     _log="$(pwd)/setup.log"
-    XUI_DETACHED=1 setsid nohup bash "$0" "$@" > "$_log" 2>&1 < /dev/null &
+    (umask 077; touch "$_log") && chmod 600 "$_log"
+    XUI_DETACHED=1 setsid nohup bash ./setup-3xui.sh "$@" > "$_log" 2>&1 < /dev/null &
     _pid=$!
     echo "Установка идёт в фоне (PID ${_pid}), лог: ${_log}"
     echo "Если SSH оборвётся — переподключитесь и смотрите: tail -f ${_log}"
@@ -55,7 +59,7 @@ echo -e "${MAGENTA}"
 cat << "BANNER"
 ╔════════════════════════════════════════════════════════╗
 ║       3x-ui · XRay · Caddy · sslh — Docker Setup       ║
-║                  Ubuntu 24.04 / 26.04                  ║
+║                  Linux · systemd · Docker Engine       ║
 ╚════════════════════════════════════════════════════════╝
 BANNER
 echo -e "${NC}"
@@ -66,18 +70,15 @@ echo -e "${NC}"
 
 if [ ! -f .env ]; then
     [ -f .env.example ] || die "Запустите скрипт из корневой директории проекта (не найден .env.example)"
-    cp .env.example .env
+    install -m 600 .env.example .env
     echo -e "${YELLOW}Файл .env создан из шаблона. Заполните его и запустите скрипт повторно:${NC}"
     echo -e "  ${BLUE}nano .env${NC}"
     exit 0
 fi
 
-# .env, скопированный с Windows, приходит с CRLF: значения получают хвостовой \r
-# (DOMAIN=example.com\r), и certbot, envsubst и compose ломаются невнятно.
-sed -i 's/\r$//' .env
-
+# Compose принимает CRLF. Для Bash удаляем CR из входного потока, сохраняя исходный файл.
 # shellcheck source=/dev/null
-source .env
+source <(sed 's/\r$//' .env)
 
 DOMAIN="${DOMAIN:?Переменная DOMAIN не задана в .env}"
 EMAIL="${EMAIL:?Переменная EMAIL не задана в .env}"
@@ -100,23 +101,15 @@ HYSTERIA="${HYSTERIA:-off}"
 case "$PROXY_MODE" in off|warp|vps) ;; *) die "Неизвестный PROXY_MODE=${PROXY_MODE} (допустимо: off, warp, vps)" ;; esac
 case "$HYSTERIA"   in off|on) ;;       *) die "Неизвестный HYSTERIA=${HYSTERIA} (допустимо: off, on)" ;; esac
 
-# Список compose-файлов собирается один раз и используется везде: при запуске,
-# в cron и в итоговой справке. Иначе --remove-orphans снесёт контейнеры,
-# объявленные в неподключённых override-файлах.
-COMPOSE_FILES=(-f docker-compose.yml)
-if [ "$PROXY_MODE" = "warp" ]; then
-    COMPOSE_FILES+=(-f docker-compose.warp.yml)
+case "${WARP_SOCKS:-auto}" in auto|hev|microsocks) ;; *) die "WARP_SOCKS: auto, hev или microsocks" ;; esac
+[[ "$SSH_PORT" =~ ^[1-9][0-9]{0,4}$ && "$SSH_PORT" -le 65535 ]] || die "Недопустимый SSH_PORT"
+[[ "$SSH_PORT" != 443 && "$SSH_PORT" != 80 ]] || die "SSH_PORT должен отличаться от публичных TCP-портов 80 и 443, занятых Caddy и sslh"
+if [[ $PROXY_MODE == vps ]]; then
+    : "${VPS_ADDRESS:?Задайте VPS_ADDRESS}" "${VPS_UUID:?Задайте VPS_UUID}"
+    VPS_PORT=${VPS_PORT:-443}
+    [[ "$VPS_PORT" =~ ^[1-9][0-9]{0,4}$ && "$VPS_PORT" -le 65535 ]] || die "Недопустимый VPS_PORT"
 fi
-if [ "$HYSTERIA" = "on" ]; then
-    COMPOSE_FILES+=(-f docker-compose.hysteria.yml)
-fi
-
-echo -e "  Домен:       ${GREEN}${DOMAIN}${NC}"
-echo -e "  Email:       ${GREEN}${EMAIL}${NC}"
-echo -e "  Timezone:    ${GREEN}${TIMEZONE}${NC}"
-echo -e "  SSH порт:    ${GREEN}${SSH_PORT}${NC}"
-echo -e "  Прокси:      ${GREEN}${PROXY_MODE}${NC}"
-echo -e "  Hysteria2:   ${GREEN}${HYSTERIA}${NC}"
+echo -e "  Домен: ${GREEN}${DOMAIN}${NC}; SSH: ${SSH_PORT}; прокси: ${PROXY_MODE}; Hysteria: ${HYSTERIA}"
 
 # ════════════════════════════════════════════════════════════════════════════
 # ШАГ 1 — Зависимости
@@ -124,55 +117,159 @@ echo -e "  Hysteria2:   ${GREEN}${HYSTERIA}${NC}"
 
 step 1 "Проверка зависимостей"
 
-command -v docker &>/dev/null || die "Docker не найден → https://docs.docker.com/engine/install/ubuntu/"
-command -v envsubst &>/dev/null || die "envsubst не найден → sudo apt-get install -y gettext-base"
-command -v python3 &>/dev/null || die "python3 не найден → sudo apt-get install -y python3"
-command -v curl &>/dev/null || die "curl не найден → sudo apt-get install -y curl"
-# `docker compose version` работает и без демона, поэтому проверяем его отдельно:
-# иначе скрипт молча умирал на шаге 2 при чтении адреса docker0.
-docker info &>/dev/null || die "Демон Docker не запущен → systemctl enable --now docker"
+[[ $DOMAIN =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ && $DOMAIN != *..* && $DOMAIN == *.* ]] || die "Нужен DNS-домен без протокола, порта и пути"
+[[ $(uname -s) == Linux && -d /run/systemd/system ]] || die "Нужен Linux с systemd"
+for tool in docker envsubst python3 curl ip sysctl flock systemctl; do
+    command -v "$tool" >/dev/null || die "Не найдена команда $tool. Зависимости: docs/install.md"
+done
+if ! systemctl is-active --quiet cron && ! systemctl is-active --quiet crond; then
+    die "Для перечитывания сертификатов и обновлений нужен работающий cron/crond с /etc/cron.d"
+fi
+[[ $(docker context inspect --format '{{.Endpoints.docker.Host}}' | head -1) == unix://* && ${DOCKER_HOST:-unix://} == unix://* ]] \
+    || die "Установка требует локальный сокет Docker"
+docker info >/dev/null || die "Нет доступа к локальному Docker Engine"
+if docker info --format '{{json .SecurityOptions}}' | grep -qw rootless; then
+    die "Требуется rootful Docker для настройки host-gateway и сетевых sysctl"
+fi
+DC=(docker compose)
+"${DC[@]}" version >/dev/null || die "Установите Docker Compose с поддержкой configs.content (см. docs/install.md)"
 
-# Поддержка docker-compose v1 (docker-compose) и v2 (docker compose).
-# v2 проверяется первым: v1.29.2 несовместим с Docker Engine 25+ (KeyError: ContainerConfig).
-if docker compose version &>/dev/null; then
-    DC=(docker compose)
-    _dc_ver=$(docker compose version --short 2>/dev/null)
-elif command -v docker-compose &>/dev/null; then
-    DC=(docker-compose)
-    _dc_ver=$(docker-compose version --short 2>/dev/null \
-              || docker-compose --version | awk '{print $3}' | tr -d ',')
-    # docker-compose v1 не работает с Docker 25+ — предупредить и прервать
-    _docker_major=$(docker version --format '{{.Server.Version}}' 2>/dev/null | cut -d. -f1)
-    if [ "${_docker_major:-0}" -ge 25 ]; then
-        die "docker-compose v1 несовместим с Docker Engine ${_docker_major}+.
-  Установите Compose v2: apt-get install -y docker-compose-v2
-  Затем запустите скрипт повторно."
+# Захватываем тот же lock, что cron и средства обслуживания, до проверки БД/файлов.
+exec 9>/run/lock/xui-container-update.lock
+flock -n 9 || die "Уже выполняется обновление стека"
+[[ ! -e pending-youtube-cache-exception.json && ! -e geodata/pending.json ]] ||
+    die "Ожидает применения правило Xray или восстановления транзакция geodata. Подробности: docs/operations.md"
+
+# Читаем маршрут из ядра; внешний IPv4 и приватный адрес docker0 независимы.
+route4=no; route6=no
+ip -4 route get 1.1.1.1 >/dev/null 2>&1 && route4=yes
+ip -6 route get 2606:4700:4700::1111 >/dev/null 2>&1 && route6=yes
+_base_config=$("${DC[@]}" -f docker-compose.yml config --format json) || die "Compose не поддерживает базовую конфигурацию"
+_net=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["networks"]["xray-net"]["name"])' <<< "$_base_config")
+_project=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["name"])' <<< "$_base_config")
+for _svc in 3x-ui caddy certbot sslh warp hysteria; do
+    if _owner=$(docker inspect --type container -f '{{index .Config.Labels "com.docker.compose.project"}}' "$_svc" 2>/dev/null); then
+        [[ $_owner == "$_project" ]] || die "Имя $_svc занято другим проектом"
     fi
-else
-    die "docker-compose / docker compose не найден.
-  Ubuntu 24 (рекомендуется): apt-get install -y docker-compose-v2
-  Ubuntu 24 (альтернатива):  apt-get install -y docker-compose"
+done
+if [[ $(docker inspect --format '{{range .Mounts}}{{println .Destination}}{{end}}' 3x-ui 2>/dev/null || true) == *'/var/lib/xray/geodata'* ]]; then
+    python3 -c '
+import json, pathlib, sys
+s = json.load(sys.stdin)["services"]["3x-ui"]
+if s.get("environment", {}).get("XRAY_LOCATION_ASSET") != "/var/lib/xray/geodata/current" or not any(
+        v["target"] == "/var/lib/xray/geodata" and v.get("read_only") and
+        pathlib.Path(v["source"]).resolve() == pathlib.Path("geodata").resolve() for v in s.get("volumes", [])):
+    sys.exit("Восстановите конфигурацию активного geodata mount перед установкой.")
+' <<< "$_base_config"
+elif [[ -e geodata-bootstrap-plan.json ]]; then
+    die "Уже подготовлен план подключения geodata, но mount ещё не активен. Дождитесь завершения запланированного обслуживания"
+fi
+_existing_ipv6=$(docker network inspect --format '{{.EnableIPv6}}' "$_net" 2>/dev/null || true)
+HOST_NETWORK=$(select_host_network "${HOST_NETWORK:-auto}" "$route4" "$route6" "$_existing_ipv6") || exit 1
+COMPOSE_FILES=(-f docker-compose.yml)
+if [[ $HOST_NETWORK != ipv4 ]]; then
+    _major=$(docker version --format '{{.Server.Version}}' | cut -d. -f1)
+    [[ $_major =~ ^[0-9]+$ && $_major -ge 27 ]] || die "Для IPv6 bridge без заданной подсети нужен Docker Engine 27+"
+    COMPOSE_FILES+=(-f docker-compose.ipv6.yml)
+fi
+if [[ $_existing_ipv6 == true && $HOST_NETWORK == ipv4 || $_existing_ipv6 == false && $HOST_NETWORK != ipv4 ]]; then
+    die "Сеть $_net уже существует с EnableIPv6=$_existing_ipv6. Измените bridge в отдельное окно или сохраните действующий профиль"
+fi
+if [[ $PROXY_MODE == warp ]]; then
+    [[ $route4 == yes && $HOST_NETWORK != ipv6 ]] || die "MicroWARP требует исходящий IPv4 для WireGuard. Используйте off или достижимый vps"
+    COMPOSE_FILES+=(-f docker-compose.warp.yml)
+    WARP_SOCKS=${WARP_SOCKS:-auto}
+    if [[ $WARP_SOCKS == auto ]]; then
+        _warp_image=$(docker inspect --format '{{.Config.Image}}' warp 2>/dev/null || true)
+        case "$_warp_image" in
+            ''|local/microwarp-hev:0.3.1-hev2.13.1) WARP_SOCKS=hev ;;
+            ghcr.io/ccbkkb/microwarp:*|ghcr.io/ccbkkb/microwarp@sha256:*) WARP_SOCKS=microsocks ;;
+            *) die "Неизвестный образ warp. Выберите WARP_SOCKS явно" ;;
+        esac
+    fi
+    [[ $WARP_SOCKS != hev ]] || COMPOSE_FILES+=(-f docker-compose.warp-udp.yml)
+fi
+[[ $HYSTERIA != on ]] || COMPOSE_FILES+=(-f docker-compose.hysteria.yml)
+"${DC[@]}" "${COMPOSE_FILES[@]}" config -q || die "Набор Compose-файлов несовместим с установленной версией"
+_selected_services=$("${DC[@]}" "${COMPOSE_FILES[@]}" config --services)
+_current_services=$(docker ps -a --filter "label=com.docker.compose.project=$_project" \
+    --format '{{.Label "com.docker.compose.service"}}')
+while IFS= read -r _svc; do
+    [[ -z $_svc ]] || grep -Fxq -- "$_svc" <<< "$_selected_services" ||
+        die "В проекте есть сервис $_svc вне выбранного профиля. Сверьте .env и существующие Compose-файлы"
+done <<< "$_current_services"
+ok "Сеть: $HOST_NETWORK. Compose: $(IFS=' '; echo "${COMPOSE_FILES[*]}")"
+
+CRON_FILE=/etc/cron.d/xray-cert-reload
+_PROJECT_DIR=$(pwd -P)
+[[ $_PROJECT_DIR != *%* && $_PROJECT_DIR != *$'\n'* ]] || die "Каталог проекта не должен содержать % или перевод строки"
+_DC_UP="$(IFS=' '; echo "${DC[*]} ${COMPOSE_FILES[*]}")"
+_CERT_RELOAD='docker exec caddy caddy reload --force --config /etc/caddy/Caddyfile'
+[[ $HYSTERIA != on ]] || _CERT_RELOAD+=' && docker restart hysteria'
+printf -v _update_command 'cd %q && %s pull --quiet --ignore-buildable && %s up -d --no-build --pull never --remove-orphans' "$_PROJECT_DIR" "$_DC_UP" "$_DC_UP"
+# Keep the normal command readable in /etc/cron.d. Quote the command if it contains a quote.
+_cron_command="'${_update_command//\'/\'\\\'\'}'"
+
+_cron_candidate=$(mktemp)
+cat > "$_cron_candidate" << CRON
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
+TIMEZONE=${TIMEZONE}
+0 4 * * * root ${_CERT_RELOAD} >> /var/log/xray-cert-reload.log 2>&1
+0 3 * * 0 root /usr/bin/flock -n /run/lock/xui-container-update.lock /bin/bash -c ${_cron_command} >> /var/log/xray-image-update.log 2>&1
+CRON
+if [[ -f $CRON_FILE ]]; then
+    # A disabled weekly task stays disabled. An active job must carry the same
+    # overrides, build policy and lock, or a later run could undo the installation.
+    _weekly=$(awk '!/^[[:space:]]*#/ && /docker[ -]compose/ && / up -d/ {print}' "$CRON_FILE")
+    _reload=$(awk '!/^[[:space:]]*#/ && /docker exec caddy caddy reload/ {print}' "$CRON_FILE")
+    if [[ -n $_weekly && ( $_weekly != *"$_DC_UP pull"* || $_weekly != *"$_DC_UP up -d"* ||
+           $_weekly != *'--ignore-buildable'* || $_weekly != *'--no-build'* ||
+           $_weekly != *'--pull never'* || $_weekly != *'/run/lock/xui-container-update.lock'* ) ||
+           -n $_reload && ( $_reload != *'--force'* || $HYSTERIA == on && $_reload != *'restart hysteria'* ||
+           $HYSTERIA == off && $_reload == *'restart hysteria'* ) ]]; then
+        install -m 644 "$_cron_candidate" "${CRON_FILE}.candidate"
+        rm -f "$_cron_candidate"
+        die "Действующий cron несовместим с профилем. Сверьте $CRON_FILE и ${CRON_FILE}.candidate перед повторным запуском."
+    fi
+    rm -f "$_cron_candidate"
+    _cron_candidate=""
+    ok "Существующий $CRON_FILE сохранён"
 fi
 
-ok "docker $(docker --version | awk '{print $3}' | tr -d ',')"
-ok "$(IFS=' '; echo "${DC[*]}") ${_dc_ver}"
-ok "envsubst $(envsubst --version 2>&1 | head -1)"
-
-# UFW: прописываем правила независимо от того, включён UFW или нет.
-# ufw allow работает и на выключенном UFW — правила сохраняются и применятся при включении.
-# sslh форвардит SSH-трафик с :443 в host.docker.internal:SSH_PORT через Docker-мост;
-# без правила 172.16.0.0/12 UFW блокирует это соединение.
-if command -v ufw &>/dev/null; then
-    ufw allow 80/tcp   >/dev/null
-    ufw allow 443/tcp  >/dev/null
-    ufw allow from 172.16.0.0/12 to any port "${SSH_PORT}" proto tcp >/dev/null
-
-    if ufw status 2>/dev/null | grep -q "Status: active"; then
-        ok "ufw: правила для 80/tcp, 443/tcp и Docker→SSH:${SSH_PORT} применены"
-    else
-        ok "ufw: правила добавлены (UFW выключен — применятся при включении)"
+# Сравниваем все A/AAAA из публичного DNS, включая узлы за NAT.
+CERT="certbot/conf/live/${DOMAIN}/fullchain.pem"
+_dns_a=""; _dns_aaaa=""
+if [[ ${SKIP_DNS_CHECK:-0} != 1 ]]; then
+    _dns_err=""
+    _dns_a=$(dns_records A) || _dns_err="Не удалось проверить DNS A"
+    _dns_aaaa=$(dns_records AAAA) || _dns_err="Не удалось проверить DNS AAAA"
+    _local_v4=$(ip -4 -o addr show scope global | awk '{split($4,a,"/"); print a[1]}')
+    _local_v6=$(ip -6 -o addr show scope global | awk '{split($4,a,"/"); print a[1]}')
+    if [[ -n $_dns_a && $route4 == yes ]]; then
+        _public_v4=$(curl -4 -fsS -m 8 https://api.ipify.org 2>/dev/null || true)
+        _local_v4+=$'\n'"${_public_v4}"
+    fi
+    if [[ -z $_dns_err ]]; then
+        if ! _dns_err=$(check_dns_addresses "$_dns_a" "$_dns_aaaa" "$_local_v4" "$_local_v6" 2>&1); then
+            _dns_err=${_dns_err:-Не удалось проверить адреса DNS}
+        fi
+    fi
+    if [[ -n $_dns_err ]]; then
+        [[ -f $CERT ]] || die "DNS: $_dns_err. Для проверенного вручную DNS: SKIP_DNS_CHECK=1 ./setup-3xui.sh"
+        fail "DNS: $_dns_err. Используется существующий сертификат"
     fi
 fi
+
+modprobe tcp_bbr 2>/dev/null || true
+grep -qw bbr /proc/sys/net/ipv4/tcp_available_congestion_control \
+    || die "В ядре нет BBR, обязательного для sysctls Compose. Нужен хост с поддержкой BBR."
+if command -v ufw >/dev/null; then
+    ufw allow 80/tcp >/dev/null
+    ufw allow 443/tcp >/dev/null
+    [[ $HYSTERIA != on ]] || ufw allow 443/udp >/dev/null
+fi
+chmod 600 .env
 
 # ════════════════════════════════════════════════════════════════════════════
 # ШАГ 2 — Директории
@@ -189,11 +286,9 @@ mkdir -p certbot/{conf,www} \
 #     На Docker 29 автоопределение отдаёт "invalid IP", и sslh не может
 #     резолвить host.docker.internal -- форвардинг SSH с 443 ломается.
 _daemon_cfg=/etc/docker/daemon.json
-# || true: без docker0 ip завершается с ошибкой, и pipefail + set -e молча
-# оборвали бы скрипт. Подставлять дефолт 172.17.0.1 тоже нельзя — без docker0
-# он заведомо неверен, и SSH через 443 сломается уже после установки.
-_host_gw=$(ip -4 -o addr show docker0 2>/dev/null | awk '{print $4}' | cut -d/ -f1 || true)
-[ -n "$_host_gw" ] || die "Не найден IPv4-адрес интерфейса docker0 (\"bridge\": \"none\" в ${_daemon_cfg}?)"
+# На хосте с внешним IPv6 sslh всё равно может обращаться к sshd через приватный IPv4.
+_host_gw=$(docker network inspect -f '{{range .IPAM.Config}}{{println .Gateway}}{{end}}' bridge 2>/dev/null |
+    awk '/^[0-9]+\./ && !seen++ {print}' || true)
 
 # Python отвечает 0, если менять нечего, 10 — если нужен рестарт демона.
 # host-gateway-ips (Docker 28+) равнозначен host-gateway-ip: второй не добавляем.
@@ -214,6 +309,8 @@ if d['log-driver'] in ('json-file', 'local'):
     opts.setdefault('max-size', '10m')
     opts.setdefault('max-file', '3')
 if 'host-gateway-ip' not in d and 'host-gateway-ips' not in d:
+    if not gw:
+        sys.exit('Нет IPv4-шлюза Docker bridge. Настройте host-gateway-ips для доступа sslh к sshd.')
     d['host-gateway-ip'] = gw
 print(json.dumps(d, indent=2))
 sys.exit(10 if json.dumps(d, sort_keys=True) != before else 0)
@@ -225,23 +322,30 @@ case "$_daemon_rc" in
     ok "Docker daemon.json уже настроен"
     ;;
   10)
-    [ -f "$_daemon_cfg" ] && cp "$_daemon_cfg" "${_daemon_cfg}.bak"
+    _had_config=false
+    if [ -f "$_daemon_cfg" ]; then
+        cp -p "$_daemon_cfg" "${_daemon_cfg}.bak"
+        _had_config=true
+    fi
+    mkdir -p /etc/docker
     mv "$_tmp" "$_daemon_cfg"
     # host-gateway-ip читается только при старте демона — reload его не подхватит.
     if ! systemctl restart docker || ! docker info &>/dev/null; then
         fail "Docker не поднялся с новым ${_daemon_cfg}"
-        if [ -f "${_daemon_cfg}.bak" ]; then
+        if [ "$_had_config" = true ]; then
             mv "${_daemon_cfg}.bak" "$_daemon_cfg"
             systemctl restart docker || true
             die "Возвращён прежний ${_daemon_cfg}. Причина: journalctl -u docker -n 30"
         fi
-        die "Причина: journalctl -u docker -n 30"
+        rm -f "$_daemon_cfg"
+        systemctl restart docker || true
+        die "Восстановлено отсутствие daemon.json. Причина: journalctl -u docker -n 30"
     fi
     ok "Docker: log rotation + host-gateway-ip=${_host_gw} (прежний конфиг: ${_daemon_cfg}.bak)"
     ;;
   *)
     rm -f "$_tmp"
-    die "Не удалось разобрать ${_daemon_cfg} — проверьте, что это валидный JSON"
+    die "Не удалось подготовить ${_daemon_cfg}; см. ошибку выше"
     ;;
 esac
 
@@ -260,12 +364,6 @@ ok "Директории готовы"
 # Важно: sysctl хоста НЕ распространяется на контейнеры — у каждого свой сетевой
 # namespace. Congestion control контейнеров задан в docker-compose.yml (sysctls:),
 # и это критично для sslh, который терминирует внешнее TCP-соединение клиента.
-# Без BBR в ядре стек не поднимется вовсе: sysctls: в docker-compose.yml у sslh,
-# caddy и 3x-ui падают с invalid argument. Лучше остановиться здесь, до запуска.
-modprobe tcp_bbr 2>/dev/null || true
-grep -qw bbr /proc/sys/net/ipv4/tcp_available_congestion_control \
-    || die "В ядре нет BBR (tcp_available_congestion_control: $(cat /proc/sys/net/ipv4/tcp_available_congestion_control)). На LXC/OpenVZ уберите sysctls из docker-compose.yml."
-
 _sysctl_cfg=/etc/sysctl.d/99-vpn-tuning.conf
 cat > "$_sysctl_cfg" << 'SYSCTL'
 net.core.default_qdisc = fq
@@ -279,7 +377,8 @@ SYSCTL
 
 if sysctl -p "$_sysctl_cfg" >/dev/null 2>&1; then
     # default_qdisc применяется только к новым интерфейсам — существующим меняем вручную
-    _iface=$(ip route show default | awk '/default/ {print $5; exit}')
+    _iface=$({ ip -4 route show default; ip -6 route show default; } |
+        awk '/^default/ && !found {for (i=1; i<NF; i++) if ($i=="dev") {print $(i+1); found=1; break}}')
     [ -n "$_iface" ] && tc qdisc replace dev "$_iface" root fq 2>/dev/null || true
     ok "Сетевой тюнинг: BBR + fq, буферы 8 МБ"
 else
@@ -295,10 +394,15 @@ step 3 "Генерация конфигов"
 [ -f config/caddy/Caddyfile ]       || die "Не найден config/caddy/Caddyfile"
 [ -f config/nginx/nginx-init.conf ] || die "Не найден config/nginx/nginx-init.conf"
 
+# shellcheck disable=SC2016  # envsubst принимает список имён переменных.
 envsubst '${DOMAIN}' < config/caddy/Caddyfile > Caddyfile
 ok "Caddyfile"
 
-cp config/nginx/nginx-init.conf nginx-init.conf
+if [[ $route6 != yes ]]; then
+    cp config/nginx/nginx-init.conf nginx-init.conf
+else
+    sed '/^    listen 80;/a\    listen [::]:80;' config/nginx/nginx-init.conf > nginx-init.conf
+fi
 ok "nginx-init.conf (временный, для certbot)"
 
 if [ "$HYSTERIA" = "on" ]; then
@@ -307,14 +411,18 @@ if [ "$HYSTERIA" = "on" ]; then
     # Пароль генерируется один раз и дописывается в .env, чтобы переустановка
     # не сбрасывала доступ у уже настроенных клиентов.
     if [ -z "${HYSTERIA_PASSWORD:-}" ]; then
-        HYSTERIA_PASSWORD=$(head -c 24 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 28)
-        printf 'HYSTERIA_PASSWORD=%s\n' "$HYSTERIA_PASSWORD" >> .env
+        HYSTERIA_PASSWORD=$(python3 -c 'import secrets; print(secrets.token_hex(20))')
+        printf '\nHYSTERIA_PASSWORD=%s\n' "$HYSTERIA_PASSWORD" >> .env
         ok "Сгенерирован HYSTERIA_PASSWORD"
     fi
     export HYSTERIA_PASSWORD
 
-    envsubst '${DOMAIN} ${HYSTERIA_PASSWORD}' \
-        < config/hysteria/config.yaml > config/hysteria/config.generated.yaml
+    # Quote the password as a YAML string even when it resembles a number or bool.
+    (umask 077
+     HYSTERIA_PASSWORD=$(python3 -c 'import json,os; print(json.dumps(os.environ["HYSTERIA_PASSWORD"]))')
+     # shellcheck disable=SC2016
+     envsubst '${DOMAIN} ${HYSTERIA_PASSWORD}' \
+        < config/hysteria/config.yaml > config/hysteria/config.generated.yaml)
     chmod 600 config/hysteria/config.generated.yaml
     ok "config/hysteria/config.generated.yaml (пароль из .env)"
 fi
@@ -325,122 +433,42 @@ fi
 
 step 4 "SSL-сертификат"
 
-# ── DNS: A и AAAA должны вести на этот сервер ───────────────────────────────
-# Let's Encrypt при наличии AAAA проверяет домен сначала по IPv6 и на IPv4 не
-# откатывается, если по IPv6 ответил чужой сервер. AAAA, оставшаяся от старого
-# хоста, даёт невнятный отказ certbot, а после установки уводит IPv6-клиентов
-# не туда. Записи берём из публичного DNS (DoH), а не через getent: тот читает
-# /etc/hosts, где cloud-init нередко прописывает домен как 127.0.1.1, а для
-# AAAA при её отсутствии возвращает v4-mapped адрес ::ffff:x.x.x.x.
-dns_records() {   # $1 = A | AAAA
-    curl -fsS -m 10 "https://dns.google/resolve?name=${DOMAIN}&type=$1" 2>/dev/null \
-        | python3 -c "
-import json, sys
-t = {'A': 1, 'AAAA': 28}['$1']
-for a in json.load(sys.stdin).get('Answer', []):
-    if a.get('type') == t: print(a['data'])
-" 2>/dev/null || true
-}
-
-SERVER_IP4=$(curl -4 -fsS -m 10 https://api.ipify.org 2>/dev/null || true)
-_dns_a=$(dns_records A)
-_dns_aaaa=$(dns_records AAAA)
-_local_v6=$(ip -6 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 || true)
-
-_dns_err=""
-if [ -z "$_dns_a" ]; then
-    _dns_err="у ${DOMAIN} нет A-записи (или DoH недоступен)"
-elif [ -n "$SERVER_IP4" ] && ! grep -qxF "$SERVER_IP4" <<< "$_dns_a"; then
-    _dns_err="A-запись ${DOMAIN} → $(echo $_dns_a), а IPv4 сервера ${SERVER_IP4}"
-fi
-while read -r _aaaa; do
-    [ -n "$_aaaa" ] || continue
-    if ! grep -qxF "$_aaaa" <<< "$_local_v6"; then
-        _dns_err="${_dns_err:+${_dns_err}; }AAAA-запись ${DOMAIN} → ${_aaaa}, но такого IPv6 на сервере нет. Удалите AAAA или пропишите адрес из: ip -6 addr show scope global"
-    fi
-done <<< "$_dns_aaaa"
-
-[ -n "$_dns_a" ] && ok "A:    $(echo $_dns_a)"
-[ -n "$_dns_aaaa" ] && ok "AAAA: $(echo $_dns_aaaa)"
-
-CERT="certbot/conf/live/${DOMAIN}/fullchain.pem"
-
-if [ -n "$_dns_err" ]; then
-    # С готовым сертификатом это не блокер, но клиентов собьёт с толку.
-    # SKIP_DNS_CHECK=1 — для DNS за прокси/GeoDNS, где проверка заведомо врёт.
-    if [ -f "$CERT" ] || [ "${SKIP_DNS_CHECK:-0}" = "1" ]; then
-        fail "DNS: ${_dns_err}"
-    else
-        die "DNS: ${_dns_err}. Проверку можно отключить: SKIP_DNS_CHECK=1 ./setup-3xui.sh"
-    fi
-fi
-
-if [ -f "$CERT" ]; then
-    ok "Сертификат уже существует, пропускаем"
+if [[ -f $CERT ]]; then
+    [[ -s certbot/conf/live/${DOMAIN}/privkey.pem ]] || die "Цепочка сертификата существует, но нет закрытого ключа"
+    ok "Сертификат уже существует"
 else
-    # Порт 80 для ACME-challenge. Если стек уже работает (повторный запуск со
-    # сменой DOMAIN), его держит Caddy и сам отдаёт /.well-known/acme-challenge
-    # из certbot/www — временный nginx тогда не нужен и не смог бы занять порт.
-    if [ "$(docker inspect -f '{{.State.Running}}' caddy 2>/dev/null || echo false)" = "true" ]; then
+    _init_name=""
+    cleanup_init() {
+        if [[ -n $_init_name ]]; then docker rm -f "$_init_name" >/dev/null 2>&1 || true; fi
+    }
+    trap cleanup_init EXIT
+    if [[ $(docker inspect -f '{{.State.Running}}' caddy 2>/dev/null || true) == true ]]; then
         ok "Порт 80 обслуживает запущенный Caddy"
     else
-        # Временный nginx только с HTTP (без SSL-блоков — сертификата ещё нет)
-        echo "  Запуск временного nginx для webroot..."
-        docker stop nginx-certbot-init 2>/dev/null || true
-        if ! docker run -d --rm --name nginx-certbot-init \
-            -p 80:80 \
+        # Host networking gives the temporary ACME listener both public families
+        # independently of the daemon's default bridge or its userland proxy.
+        _init_name=$(docker run -d --rm --network host \
             -v "$(pwd)/nginx-init.conf:/etc/nginx/conf.d/default.conf:ro" \
-            -v "$(pwd)/certbot/www:/var/www/certbot" \
-            nginx:alpine; then
-            die "Не удалось запустить nginx на порту 80. Проверьте: ss -tlnp | grep :80"
-        fi
-
-        # Подождать, пока nginx полностью поднимется (bash /dev/tcp — без внешних зависимостей)
-        _retries=10
-        until bash -c 'echo >/dev/tcp/localhost/80' 2>/dev/null || [ $_retries -eq 0 ]; do
-            sleep 1; _retries=$((_retries - 1))
+            -v "$(pwd)/certbot/www:/var/www/certbot:ro" nginx:alpine)
+        _ready=false
+        for _attempt in {1..10}; do
+            if [[ $(docker inspect -f '{{.State.Running}}' "$_init_name" 2>/dev/null || true) != true ]]; then
+                die "Временный nginx не запущен. Проверьте занятость порта 80"
+            fi
+            if curl --noproxy '*' -fsSm 2 http://127.0.0.1:80/ >/dev/null; then _ready=true; break; fi
+            sleep 1
         done
-        [ $_retries -gt 0 ] || { docker stop nginx-certbot-init 2>/dev/null || true; die "nginx не ответил на порту 80 за 10 секунд. Проверьте: ss -tlnp | grep :80"; }
-        ok "nginx слушает порт 80"
+        [[ $_ready == true ]] || die "Временный nginx не ответил на порту 80"
     fi
 
-    echo "  Запрос сертификата для: ${DOMAIN}"
-
-    if ! docker run --rm \
+    docker run --rm --network host \
         -v "$(pwd)/certbot/conf:/etc/letsencrypt" \
         -v "$(pwd)/certbot/www:/var/www/certbot" \
-        certbot/certbot certonly \
-            --webroot \
-            --webroot-path=/var/www/certbot \
-            --non-interactive \
-            --agree-tos \
-            --no-eff-email \
-            --email "${EMAIL}" \
-            -d "${DOMAIN}"; then
-
-        docker stop nginx-certbot-init 2>/dev/null || true
-        fail "Не удалось получить сертификат"
-        echo ""
-        echo -e "${YELLOW}Проверьте:${NC}"
-        echo "  • DNS: A (и AAAA, если есть) ${DOMAIN} → этот сервер"
-        echo "  • Firewall хостера и ufw: открыт 80/tcp"
-        echo "  • Порт 80 не занят другим процессом: ss -tlnp | grep :80"
-        exit 1
-    fi
-
-    docker stop nginx-certbot-init 2>/dev/null || true
-
-    # certbot сохраняет метод получения в renewal-конфиге.
-    # Меняем authenticator на webroot — иначе renewal-контейнер попытается
-    # использовать standalone и упрётся в запущенный nginx.
-    RENEWAL="certbot/conf/renewal/${DOMAIN}.conf"
-    if [ -f "$RENEWAL" ]; then
-        sed -i 's/^authenticator = .*/authenticator = webroot/' "$RENEWAL"
-        grep -q 'webroot_path' "$RENEWAL" \
-            || echo "webroot_path = /var/www/certbot" >> "$RENEWAL"
-        ok "Renewal-конфиг переключён на webroot"
-    fi
-
+        certbot/certbot certonly --webroot --webroot-path=/var/www/certbot \
+        --non-interactive --agree-tos --email "$EMAIL" -d "$DOMAIN" \
+        || die "Не удалось получить сертификат. Проверьте все A/AAAA и входящий 80/tcp"
+    cleanup_init
+    trap - EXIT
     ok "Сертификат получен"
 fi
 
@@ -450,15 +478,25 @@ fi
 
 step 5 "Запуск Docker-контейнеров"
 
-# Убедиться, что порт 80 свободен
-docker stop nginx-certbot-init 2>/dev/null || true
-
-"${DC[@]}" "${COMPOSE_FILES[@]}" pull --quiet
+"${DC[@]}" "${COMPOSE_FILES[@]}" pull --quiet --ignore-buildable
+if [[ $PROXY_MODE == warp && $WARP_SOCKS == hev ]]; then
+    # The derivative is local. Preserve the running tested build on a repeat install.
+    _hev_image=$("${DC[@]}" "${COMPOSE_FILES[@]}" config --format json | python3 -c 'import json,sys; print(json.load(sys.stdin)["services"]["warp"]["image"])')
+    docker image inspect "$_hev_image" >/dev/null 2>&1 || "${DC[@]}" "${COMPOSE_FILES[@]}" build warp
+fi
 
 # COMPOSE_FILES собран выше по PROXY_MODE и HYSTERIA. Передавать его обязательно:
 # --remove-orphans удалит контейнеры из override-файлов, которые не подключены.
-"${DC[@]}" "${COMPOSE_FILES[@]}" up -d --remove-orphans
+"${DC[@]}" "${COMPOSE_FILES[@]}" up -d --no-build --pull never --remove-orphans
 
+if command -v ufw >/dev/null; then
+    # Only the actual project bridge should reach host sshd. Docker might use
+    # a custom IPv4 pool outside 172.16/12 and a different bridge name.
+    _id=$(docker network inspect -f '{{.Id}}' "$_net")
+    _if=$(docker network inspect -f '{{index .Options "com.docker.network.bridge.name"}}' "$_net")
+    [[ -n $_if && $_if != '<no value>' ]] || _if="br-${_id:0:12}"
+    ufw allow in on "$_if" to any port "$SSH_PORT" proto tcp >/dev/null
+fi
 ok "Контейнеры запущены"
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -468,15 +506,15 @@ ok "Контейнеры запущены"
 step 6 "Проверка состояния"
 
 sleep 5
-"${DC[@]}" ps
+"${DC[@]}" "${COMPOSE_FILES[@]}" ps
 
 # Caddyfile смонтирован файлом, и up -d не пересоздаёт caddy, если изменился
 # только он: при повторном запуске Caddy остался бы со старым конфигом.
 # --force — потому что без него reload с неизменным конфигом ничего не делает,
 # а сертификат для нового DOMAIN тоже нужно подхватить.
-docker exec caddy caddy reload --force --config /etc/caddy/Caddyfile >/dev/null 2>&1 \
-    && ok "Caddy перечитал Caddyfile" \
-    || fail "caddy reload не прошёл: docker logs caddy --tail 20"
+docker exec caddy caddy reload --force --config /etc/caddy/Caddyfile >/dev/null \
+    || die "caddy reload не прошёл: docker logs caddy --tail 20"
+ok "Caddy перечитал Caddyfile"
 
 # Статус running сам по себе ничего не гарантирует: контейнер в цикле падений
 # в момент проверки тоже running, а sslh может работать, но не пересылать SSH
@@ -484,7 +522,7 @@ docker exec caddy caddy reload --force --config /etc/caddy/Caddyfile >/dev/null 
 # ли счётчик рестартов, и проверяем реальный путь через 443. Счётчик сравниваем
 # во времени, а не с нулём: у давно работающего контейнера он бывает ненулевым.
 _failed=0
-_svcs=(sslh caddy 3x-ui)
+mapfile -t _svcs <<< "$_selected_services"
 declare -A _restarts
 for _svc in "${_svcs[@]}"; do
     _restarts[$_svc]=$(docker inspect --format='{{.RestartCount}}' "$_svc" 2>/dev/null || echo 0)
@@ -502,25 +540,24 @@ for _svc in "${_svcs[@]}"; do
     fi
 done
 
-# SSH через 443: клиент молчит, sslh по таймауту отдаёт соединение в ssh,
-# и должен прийти баннер sshd.
-_banner=$(timeout 15 bash -c 'exec 3<>/dev/tcp/127.0.0.1/443; head -c 4 <&3' 2>/dev/null || true)
-if [ "$_banner" = "SSH-" ]; then
-    ok "SSH через 443 отвечает"
-else
-    fail "SSH через 443 не отвечает — не закрывайте порт ${SSH_PORT}. Логи: docker logs sslh --tail 20"
-    _failed=1
-fi
-
-# TLS через 443: sslh → Caddy, сертификат валиден для DOMAIN, сайт отдаёт 200.
-_code=$(curl -sS -o /dev/null -w '%{http_code}' -m 15 \
-        --resolve "${DOMAIN}:443:127.0.0.1" "https://${DOMAIN}/" 2>/dev/null || true)
-if [ "$_code" = "200" ]; then
-    ok "HTTPS через 443: сайт отвечает, сертификат валиден"
-else
-    fail "HTTPS через 443: ответ '${_code:-нет}'. Проверьте: curl -v --resolve ${DOMAIN}:443:127.0.0.1 https://${DOMAIN}/"
-    _failed=1
-fi
+# Probe both listeners on a dual-stack bridge. Force the requested destination
+# and send SSH identification so this also checks the selected protocol backend.
+_probes=(127.0.0.1)
+[[ $HOST_NETWORK == ipv4 && -z $_dns_aaaa ]] || _probes+=(::1)
+for _addr in "${_probes[@]}"; do
+    if python3 - "$_addr" <<'PY'
+import socket, sys
+with socket.create_connection((sys.argv[1], 443), timeout=12) as sock:
+    sock.sendall(b"SSH-2.0-XuiSetup\r\n")
+    if sock.makefile("rb").read(4) != b"SSH-":
+        sys.exit("Missing SSH banner")
+PY
+    then ok "SSH $_addr:443"; else fail "SSH $_addr:443 недоступен; сохраните прямой SSH"; _failed=1; fi
+    _resolve=$_addr; [[ $_addr != *:* ]] || _resolve="[$_addr]"
+    _code=$(curl --noproxy '*' -sS -o /dev/null -w '%{http_code}' -m 15 \
+            --resolve "${DOMAIN}:443:${_resolve}" "https://${DOMAIN}/" || true)
+    if [[ $_code == 200 ]]; then ok "HTTPS $_addr:443"; else fail "HTTPS $_addr:443: $_code"; _failed=1; fi
+done
 
 [ $_failed -eq 0 ] || die "Стек поднят с ошибками. Проверьте логи выше."
 
@@ -530,37 +567,11 @@ fi
 
 step 7 "Cron: перечитывание сертификата и обновление образов"
 
-CRON_FILE="/etc/cron.d/xray-cert-reload"
-_PROJECT_DIR="$(pwd)"
-_DC_UP="$(IFS=' '; echo "${DC[*]} ${COMPOSE_FILES[*]}")"
-
-# Сертификат читает Caddy (он терминирует TLS), а не XRay — у XRay security: none.
-# --force обязателен: Caddyfile после продления тот же, и без него Caddy пишет
-# «config is unchanged» и продолжает отдавать старый сертификат до истечения.
-# reload перечитывает сертификат без разрыва соединений.
-_CERT_RELOAD='docker exec caddy caddy reload --force --config /etc/caddy/Caddyfile'
-if [ "$HYSTERIA" = "on" ]; then
-    # Hysteria2 читает сертификат при старте, поэтому её нужно перезапустить.
-    _CERT_RELOAD="${_CERT_RELOAD} && docker restart hysteria"
+if [[ -n $_cron_candidate ]]; then
+    install -m 644 "$_cron_candidate" "$CRON_FILE"
+    rm -f "$_cron_candidate"
+    ok "Создан $CRON_FILE"
 fi
-
-cat > "$CRON_FILE" << CRON
-SHELL=/bin/bash
-PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
-# compose из cron видит только .env, а TIMEZONE скрипт мог взять из системы:
-# без этой строки недельное обновление пересоздавало бы 3x-ui с UTC.
-TIMEZONE=${TIMEZONE}
-
-# Certbot обновляет сертификат за 30 дней до истечения; ежесуточной перезагрузки достаточно.
-# Запуск в 4:00 ночи — минимум активных соединений.
-0 4 * * * root ${_CERT_RELOAD} >> /var/log/xray-cert-reload.log 2>&1
-
-# Автообновление Docker-образов
-# Запуск раз в неделю в воскресенье в 3:00 ночи.
-0 3 * * 0 root cd "${_PROJECT_DIR}" && ${_DC_UP} pull --quiet && ${_DC_UP} up -d --remove-orphans >> /var/log/xray-image-update.log 2>&1
-CRON
-chmod 644 "$CRON_FILE"
-ok "Создан $CRON_FILE"
 
 # ════════════════════════════════════════════════════════════════════════════
 # ШАГ 8 — Исходящий прокси XRay
@@ -568,82 +579,18 @@ ok "Создан $CRON_FILE"
 
 step 8 "Исходящий прокси (PROXY_MODE=${PROXY_MODE})"
 
-# connIdle по умолчанию 300 с: XRay рвёт соединение, по которому 5 минут не
-# шло ни байта. Стриминговые API (LLM, SSE) молчат дольше, пока генерируют
-# большой ответ, и обрываются на середине. Нужно при любом PROXY_MODE.
-echo ""
-echo -e "${YELLOW}0. Настройки → XRay Configs → Advanced — замените блок policy на:${NC}"
-echo ""
-cat config/xray/policy.json
-echo ""
-
-case "${PROXY_MODE}" in
-
-  off)
-    ok "Прокси отключён — XRay выходит напрямую в интернет"
-    ;;
-
-  warp)
-    ok "WARP-контейнер запущен (поднят на шаге 5)"
-
-    echo ""
-    echo -e "${YELLOW}1. Настройки → XRay Configs → Custom Config — вставьте:${NC}"
-    echo ""
-    cat config/xray/outbound-warp.json
-    echo ""
-    echo -e "${YELLOW}2. Настройки → XRay Configs → Routing Rules — добавьте правило:${NC}"
-    echo ""
-    cat config/xray/routing-warp.json
-    echo ""
-    echo -e "${YELLOW}3. Туда же — запасное правило, ПОД правилом warp:${NC}"
-    echo ""
-    cat config/xray/routing-direct.json
-    echo ""
-    echo -e "${YELLOW}Пока оно ниже, оно не срабатывает: warp перехватывает весь${NC}"
-    echo -e "${YELLOW}tcp,udp раньше. Если WARP сломается — поднимите его выше${NC}"
-    echo -e "${YELLOW}правила warp, и трафик пойдёт напрямую без правки конфигов.${NC}"
-    echo ""
-    echo -e "${YELLOW}После сохранения нажмите «Restart XRay» в панели.${NC}"
-    echo -e "${YELLOW}Правила обязаны лежать плоско в routing.rules: если вставить${NC}"
-    echo -e "${YELLOW}блок routing целиком в Custom Config, панель вложит его внутрь${NC}"
-    echo -e "${YELLOW}rules, и XRay не стартует (exit status 23).${NC}"
-    ;;
-
-  vps)
-    VPS_ADDRESS="${VPS_ADDRESS:?Переменная VPS_ADDRESS не задана в .env}"
-    VPS_PORT="${VPS_PORT:-443}"
-    VPS_UUID="${VPS_UUID:?Переменная VPS_UUID не задана в .env}"
-    VPS_SNI="${VPS_SNI:-${VPS_ADDRESS}}"
-    export VPS_ADDRESS VPS_PORT VPS_UUID VPS_SNI
-
-    envsubst '${VPS_ADDRESS} ${VPS_PORT} ${VPS_UUID} ${VPS_SNI}' \
-        < config/xray/outbound-vps.json > outbound-config.json
-    ok "Конфиг сгенерирован → outbound-config.json"
-
-    echo ""
-    echo -e "${YELLOW}1. Настройки → XRay Configs → Custom Config — вставьте:${NC}"
-    echo ""
-    cat outbound-config.json
-    echo ""
-    echo -e "${YELLOW}2. Настройки → XRay Configs → Routing Rules — добавьте правило:${NC}"
-    echo ""
-    cat config/xray/routing-vps.json
-    echo ""
-    echo -e "${YELLOW}3. Туда же — запасное правило, ПОД правилом vps:${NC}"
-    echo ""
-    cat config/xray/routing-direct.json
-    echo ""
-    echo -e "${YELLOW}Если exit VPS отвалится — поднимите его выше, и трафик${NC}"
-    echo -e "${YELLOW}пойдёт напрямую.${NC}"
-    echo ""
-    echo -e "${YELLOW}После сохранения нажмите «Restart XRay» в панели.${NC}"
-    ;;
-
-  *)
-    fail "Неизвестный PROXY_MODE=${PROXY_MODE} (допустимые значения: off, warp, vps)"
-    exit 1
-    ;;
-esac
+echo "Настройте inbound, policy и маршруты по docs/panel.md и docs/outbound.md."
+echo "Служебные правила API и блокировки должны находиться выше общего маршрута."
+if [[ $PROXY_MODE == vps ]]; then
+    export VPS_ADDRESS VPS_PORT VPS_UUID VPS_SNI="${VPS_SNI:-$VPS_ADDRESS}"
+    (umask 077
+     # shellcheck disable=SC2016
+     envsubst '${VPS_ADDRESS} ${VPS_PORT} ${VPS_UUID} ${VPS_SNI}' < config/xray/outbound-vps.json > outbound-config.json)
+    chmod 600 outbound-config.json
+    ok "Конфигурация выхода VPS: outbound-config.json"
+elif [[ $PROXY_MODE == warp ]]; then
+    ok "WARP: $WARP_SOCKS. Настройте outbound warp-out и правила панели по docs/outbound.md."
+fi
 
 # ════════════════════════════════════════════════════════════════════════════
 # Итог
@@ -663,67 +610,16 @@ echo ""
 echo -e "${GREEN}Первый вход в панель (только через SSH-туннель):${NC}"
 echo -e "  ${YELLOW}ssh -L 2053:localhost:2053 -p 443 user@${DOMAIN}${NC}"
 echo -e "  Затем открыть: ${BLUE}http://localhost:2053${NC}"
-echo -e "  Логин: ${YELLOW}admin${NC}   Пароль: ${YELLOW}admin${NC}  ${RED}← сразу смените!${NC}"
-
-echo ""
-# IPv4 сервера — для подсказки по dns.hosts в клиентском конфиге. Не getent:
-# он вернул бы AAAA или 127.0.1.1 из /etc/hosts, а нужен именно внешний IPv4.
-DOMAIN_IP="${SERVER_IP4:-$(head -1 <<< "$_dns_a")}"
-[ -n "$DOMAIN_IP" ] || DOMAIN_IP="<ip сервера>"
-
-echo -e "${GREEN}Настройка XRay Inbound в панели:${NC}"
-echo "  Protocol:     VLESS"
-echo "  Port:         10000"
-echo -e "  Security:     ${YELLOW}None${NC}  — TLS снимает Caddy, не XRay."
-echo "                Пути к сертификатам в панели указывать не нужно."
-echo ""
-echo -e "${GREEN}Вариант A — xHTTP (рекомендуется, обходит DPI):${NC}"
-echo "  Transmission: xHTTP"
-echo "  Path:         /game  (или любой другой)"
-echo "  Host:         ${DOMAIN}"
-echo "  Mode:         auto   — режим выбирает клиент"
-echo ""
-echo -e "  ${YELLOW}Ссылку из панели импортировать нельзя:${NC} она содержит внутренний"
-echo -e "  ${YELLOW}порт 10000 и security=none. Приведите её к рабочему виду:${NC}"
-echo "    python3 tools/xui-link.py '<ссылка из панели>'"
-echo "  Ссылка уже содержит xmux (параметр extra). JSON нужен, только если"
-echo "  хотите прописать IP в dns.hosts: --ip ${DOMAIN_IP}"
-echo ""
-# Docker-сеть стека без IPv6: XRay не может открыть соединение на IPv6-адрес.
-# Клиент с IPv6 в TUN шлёт такие адреса в туннель, а приложение не откатывается
-# на IPv4, потому что TUN уже принял соединение локально, — сайты висят.
-echo -e "  ${YELLOW}В клиенте выключите IPv6 (v2rayNG: «Enable IPv6» — выкл.):${NC}"
-echo -e "  ${YELLOW}выход в интернет у сервера только по IPv4.${NC}"
-echo ""
-echo -e "${GREEN}Вариант B — TCP/RAW (проще, но хуже обходит блокировки):${NC}"
-echo "  Transmission: TCP (RAW)"
-echo "  TLS:          включить,  uTLS: none,  ALPN: http/1.1"
-echo "  SNI клиента:  ${DOMAIN}"
-echo "  Fallback:     [{\"dest\":\"caddy:8080\",\"xVer\":0}]"
-
-if [ "$PROXY_MODE" != "off" ]; then
-    echo ""
-    echo -e "${GREEN}Исходящий прокси:${NC}"
-    case "$PROXY_MODE" in
-      warp) echo "  Маршрут: XRay → WARP → интернет" ;;
-      vps)  echo "  Маршрут: XRay → VPS (${VPS_ADDRESS}:${VPS_PORT}) → интернет" ;;
-    esac
-    echo -e "  ${YELLOW}Не забудьте вставить Custom Config и перезапустить XRay в панели!${NC}"
+echo "  Доступ к панели и конфигурация xHTTP /game: docs/panel.md"
+echo "  Параметры клиента: python3 tools/xui-link.py '<ссылка из панели>'"
+if [[ $HOST_NETWORK == ipv4 || $PROXY_MODE == warp ]]; then
+    echo "  Для IPv4-выхода выбирайте IPv4 в клиенте. Публичный адрес входа задаётся DNS домена."
 fi
-
-echo ""
 
 if [ "$HYSTERIA" = "on" ]; then
     echo ""
     echo -e "${GREEN}Hysteria2 (QUIC/UDP на :443/udp):${NC}"
-    echo -e "  ${YELLOW}v2rayNG этот протокол не поддерживает — нужен Hiddify, NekoBox или sing-box.${NC}"
-    echo ""
-    echo "  Ссылка для импорта (общая на всех клиентов):"
-    echo "    hy2://${HYSTERIA_PASSWORD}@${DOMAIN}:443/?sni=${DOMAIN}#${DOMAIN}-hy2"
-    echo ""
-    echo -e "  ${YELLOW}В клиенте задайте полосу (Upload/Download Mbps) чуть ниже реальной${NC}"
-    echo -e "  ${YELLOW}скорости канала — иначе не включится Brutal и смысл транспорта теряется.${NC}"
-    echo -e "  ${YELLOW}Выставьте в клиенте IPv6 Mode = Disable: выход у сервера только по IPv4.${NC}"
+    echo "  Пароль находится в .env (HYSTERIA_PASSWORD). Настройка клиента: docs/hysteria.md"
 fi
 _dc=$(IFS=" "; echo "${DC[*]} ${COMPOSE_FILES[*]}")
 echo -e "${GREEN}Полезные команды:${NC}"
@@ -732,5 +628,5 @@ echo "  ${_dc} logs -f 3x-ui            # логи панели / XRay"
 echo "  ${_dc} logs -f caddy            # логи Caddy"
 echo "  ${_dc} logs -f sslh             # логи мультиплексора"
 echo "  ${_dc} restart caddy            # перезапуск Caddy"
-echo "  ${_dc} pull && ${_dc} up -d     # обновить образы"
+echo "  ${_dc} pull --ignore-buildable && ${_dc} up -d --no-build --pull never  # обновить образы"
 echo ""

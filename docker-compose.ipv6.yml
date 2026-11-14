@@ -1,0 +1,17 @@
+# Native IPv6 for the project bridge. IPv4 remains available inside the stack
+# for the panel loopback mapping and for sslh → host.docker.internal.
+networks:
+  xray-net:
+    enable_ipv6: true
+
+configs:
+  sslh-cfg:
+    content: |
+      foreground: true;
+      numeric: true;
+      listen: ( { host: "0.0.0.0"; port: "443"; }, { host: "::"; port: "443"; } );
+      protocols: (
+        { name: "ssh";     host: "host.docker.internal"; port: "${SSH_PORT:-22}"; resolve_on_forward: true; },
+        { name: "tls";     host: "caddy"; port: "8443"; resolve_on_forward: true; },
+        { name: "anyprot"; host: "caddy"; port: "8443"; resolve_on_forward: true; }
+      );

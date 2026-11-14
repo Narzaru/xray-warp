@@ -1,0 +1,15 @@
+[Unit]
+Description=Validate and apply Xray geodata during the Novosibirsk night window
+After=docker.service network-online.target
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=oneshot
+User=root
+UMask=0077
+WorkingDirectory=/opt/x-ui
+ExecStart=/usr/bin/python3 /opt/x-ui/tools/update-geodata.py --nightly --bootstrap-plan /opt/x-ui/geodata-bootstrap-plan.json
+TimeoutStartSec=25min
+TimeoutStopSec=120
+KillMode=mixed

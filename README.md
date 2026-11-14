@@ -1,43 +1,23 @@
-> Написано с помощью [Claude Code](https://claude.ai/code)
+# 3x-ui · Xray · Caddy · sslh
 
-# 3x-ui · XRay · Caddy · sslh — Docker Setup
+VLESS/XHTTP и SSH используют один публичный TCP-порт 443. sslh передаёт SSH демону хоста, а TLS — Caddy. Caddy отдаёт сайт и проксирует путь `/game` по HTTP/2 без TLS в Xray. Панель 3x-ui доступна через SSH-туннель. Hysteria2 на UDP 443 — отдельный, необязательный сервис.
 
-XRay-прокси (VLESS + xHTTP) на порту 443 за настоящим HTTPS-сайтом. Один домен, одна A-запись, SSH на том же порту. Снаружи сервер выглядит как обычный сайт с сертификатом Let's Encrypt.
+**Рабочий VPS на 14 ноября 2026 года:** Xray блокирует российские назначения для клиентского входа; разрешённые TCP и UDP идут через MicroWARP + Hev. Прямого резерва нет. Обновление GeoIP/GeoSite и исключение для одного видеокэша подготовлены к ночному применению. [Сверка работающей конфигурации](docs/server-state.md) отделяет действующие настройки от запланированных и от настроек новой установки.
 
-```
-:443/tcp ─► sslh ─┬─ SSH ─► host sshd
-                  └─ TLS ─► Caddy ─┬─ /game ─► XRay (3x-ui) ─► direct / WARP / exit VPS
-                                   └─ всё остальное ─► фейковый сайт
-:443/udp ─► Hysteria2 (опционально)
-```
+## Новая установка
 
-## Быстрый старт
+1. Подготовьте Linux-хост с Docker Engine, Compose v2, доменом и доступными портами 80/tcp и 443/tcp. Выберите профиль IPv4, IPv6 или dual по [инструкции установки](docs/install.md).
+2. В каталоге проекта скопируйте `.env.example` в `.env`, задайте домен, email, порт SSH и нужный выход. Запустите `sudo bash setup-3xui.sh`. Установщик изменяет хост; не используйте его для проверки работающего VPS.
+3. Создайте [inbound в панели](docs/panel.md#inbound), примените policy и [маршруты выбранного выхода](docs/outbound.md). Установка контейнера WARP сама по себе маршрут Xray не меняет.
+4. Преобразуйте клиентскую ссылку из панели с помощью [xui-link.py](tools/xui-link.py): внешний порт, TLS и SNI отличаются от значений внутреннего inbound.
 
-Нужны Ubuntu 24.04/26.04, публичный IP и A-запись домена на него.
-
-```bash
-apt-get install -y docker.io docker-compose-v2 gettext-base
-git clone https://github.com/Narzaru/xray-warp.git /opt/x-ui && cd /opt/x-ui
-cp .env.example .env && nano .env      # DOMAIN, EMAIL, SSH_PORT, PROXY_MODE
-sudo ./setup-3xui.sh
-```
-
-Дальше:
-
-1. Открыть панель через SSH-туннель: `ssh -L 2053:localhost:2053 -p 443 root@yourdomain.com` → `http://localhost:2053`.
-2. Создать inbound VLESS / xHTTP / порт 10000 / **Security: None** — [подробно](docs/panel.md#inbound).
-3. Применить `config/xray/policy.json` (Settings → Xray Configs) — [зачем](docs/network.md#таймауты-простоя).
-4. Прогнать ссылку клиента через `python3 tools/xui-link.py '<ссылка>'` — ссылка из панели как есть не работает, [почему](docs/panel.md#ссылка-для-клиента).
-
-## Документация
-
-| Файл | О чём |
+| Что нужно сделать | Где смотреть |
 |---|---|
-| [docs/architecture.md](docs/architecture.md) | Как устроен стек, зачем Caddy и почему TLS снимает он, структура файлов |
-| [docs/install.md](docs/install.md) | Требования, `.env`, шаги скрипта, фаервол, сертификат |
-| [docs/panel.md](docs/panel.md) | Inbound в 3x-ui, параметры клиента, `xui-link.py` |
-| [docs/network.md](docs/network.md) | Мобильные сети: режимы xHTTP, xmux, BBR, таймауты простоя, диагностика TCP |
-| [docs/outbound.md](docs/outbound.md) | Смена выходного IP: `PROXY_MODE=warp` / `vps` |
-| [docs/hysteria.md](docs/hysteria.md) | Hysteria2 (QUIC/UDP) для каналов с потерями |
-| [docs/operations.md](docs/operations.md) | Повседневные команды, автообновление, логи |
-| [docs/troubleshooting.md](docs/troubleshooting.md) | Ошибки по симптомам |
+| Проверить, что сейчас активно на VPS | [Состояние на 14.11.2026](docs/server-state.md) |
+| Разобраться в портах, сервисах и файлах | [Архитектура](docs/architecture.md) |
+| Выбрать профиль сети, настроить DNS, сертификат, firewall | [Установка](docs/install.md) |
+| Настроить VLESS, sniffing, policy и клиент | [Панель и ссылки](docs/panel.md) |
+| Выбрать WARP, прямой выход или второй VPS; проверить порядок правил | [Исходящий трафик](docs/outbound.md) |
+| Подключить отдельный QUIC-вход | [Hysteria2](docs/hysteria.md) |
+| Обслуживать стек, образы и базы | [Эксплуатация](docs/operations.md) |
+| Разобрать обрыв или зависание | [По симптомам](docs/troubleshooting.md) · [TCP, IPv6 и таймауты](docs/network.md) · [Архив диагностики](docs/diagnostics-2026-11-04-youtube.md) |

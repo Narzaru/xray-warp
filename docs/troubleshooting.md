@@ -50,7 +50,11 @@ geoip:telegram
 
 ## Google/YouTube висят, остальное работает
 
-Скорее всего, в клиенте включён IPv6: сервер выходит в интернет только по IPv4 и IPv6-адреса назначения открыть не может. Выключите IPv6 в клиенте — [docs/network.md](network.md#ipv6).
+Для рабочего VPS есть несколько разных случаев:
+
+- Если назначение — IPv6-адрес, проверьте IPv6 в TUN: текущий выход Hev работает по IPv4. [Разница между IPv6 входа и выхода](network.md#ipv6).
+- Если зависает только определённый `googlevideo.com`, сверьте имя кэша, порт и порядок RU-правил. На 14 ноября один российский кэш разрешён **только в подготовленном плане**; обновление официальных баз само по себе не убирает `geoip:ru`. [Состояние заявки](server-state.md#что-ещё-не-применено).
+- Если сбой связан с перемоткой, запишите в DevTools протокол запроса к видео: h3 (QUIC) и h2 идут разными путями внутри туннеля. Один ответ 429 или отдельный красный запрос не устанавливают причину зависания. См. [историческое расследование](diagnostics-2026-11-04-youtube.md).
 
 ## Нормальные ошибки в логах XRay
 
@@ -64,7 +68,7 @@ Failure in running xray-core: exit status 23
 ... neither outboundTag nor balancerTag is specified in routing rule
 ```
 
-Почти всегда — блок `routing` вставлен в **Custom Config** вместе с outbounds. 3x-ui 26.9.x вкладывает его целиком в `routing.rules` как одно правило без `outboundTag`. Убрать `routing` из Custom Config и добавить правила отдельно в **Routing Rules** ([docs/outbound.md](outbound.md#как-применяются-шаблоны)).
+Почти всегда — блок `routing` вставлен в **Custom Config** вместе с outbounds. Редактор отдельного правила может вложить его целиком в `routing.rules` как одно правило без `outboundTag`. Убрать `routing` из Custom Config и добавить правила отдельно в **Routing Rules** ([docs/outbound.md](outbound.md#как-применяются-шаблоны)).
 
 Ещё одна причина — правило вообще без условий (`{"type": "field", "outboundTag": "direct"}`): новые версии XRay его отвергают. Нужно хотя бы `"network": "tcp,udp"`.
 
@@ -78,13 +82,13 @@ docker exec 3x-ui cat /app/bin/config.json
 
 ```bash
 docker logs warp --tail 30
-docker exec 3x-ui curl -s -x socks5://warp:1080 https://ifconfig.me   # должен быть IP Cloudflare
+docker inspect --format '{{.State.Health.Status}}' warp
 ```
 
 - `Operation not permitted` при инициализации WireGuard — нужен `cap_add: SYS_MODULE` (уже в `docker-compose.warp.yml`). Если wireguard встроен в ядро, хватит `NET_ADMIN`. Проверить: `lsmod | grep wireguard`, `modinfo wireguard`.
 - Отказ стартовать без `SOCKS_USER`/`SOCKS_PASS` — в compose уже задан `ALLOW_NO_AUTH=1`; проверьте, что используется актуальный `docker-compose.warp.yml`.
 - `unsafe procfs detected ... disable_ipv6` — ошибка старого образа `caomingjun/warp` на ядрах без IPv6. Перейдите на MicroWARP из текущего compose.
-- WARP лёг, а клиентам нужен доступ прямо сейчас — поднимите правило `direct` выше `warp-out` в Routing Rules ([docs/outbound.md](outbound.md#proxy_modewarp)).
+- Если TCP работает, а UDP нет, сверьте **образ**: upstream MicroSOCKS не поддерживает UDP ASSOCIATE. В рабочем профиле нужен локальный Hev. При отказе WARP рабочая политика прекращает передачу; переключение на direct меняет политику и раскрывает IP VPS.
 
 ## Certbot: Connection refused
 
@@ -93,26 +97,12 @@ docker exec 3x-ui curl -s -x socks5://warp:1080 https://ifconfig.me   # долж
 Let's Encrypt не может скачать ACME-challenge:
 
 1. **Фаервол хостера** (самое частое). У Hetzner, DigitalOcean, Timeweb и др. он отдельный от UFW — откройте входящие TCP **80** и **443** в панели провайдера.
-2. **Порт 80 занят**: `ss -tlnp | grep :80` — остановите процесс перед запуском скрипта.
+2. **Порт 80 занят**: посмотрите слушателя в `ss -tlnp`. Рабочий Caddy может обслуживать challenge сам; если порт занят другим сайтом, согласуйте webroot или отдельное окно обслуживания.
 3. **DNS не обновился**: `dig +short yourdomain.com` должен вернуть IP сервера.
 
 ## Временный nginx для certbot падает
 
-`docker run` вернул ID, но `docker ps` пуст. Этот nginx поднимается только на шаге 4 ради ACME-challenge. Посмотреть ошибку:
-
-```bash
-docker run -d --name nginx-debug -p 80:80 \
-    -v "$(pwd)/nginx-init.conf:/etc/nginx/conf.d/default.conf:ro" nginx:alpine
-docker logs nginx-debug; docker rm -f nginx-debug
-```
-
-- `socket() [::]:80 failed (97: Address family not supported)` — ядро без IPv6, а на сервере старая копия конфига с `listen [::]:80`. Обновите файлы.
-- `not a directory: Are you trying to mount a directory onto a file?` — скрипт запущен не из директории проекта, и Docker создал папку вместо файла:
-
-  ```bash
-  rm -rf nginx-init.conf
-  ls config/nginx/nginx-init.conf   # убедиться, что вы в директории проекта
-  ```
+При первой выдаче сертификата установщик использует временный nginx в host network. Проверьте занятость 80/tcp на хосте, выбранные семейства DNS и сгенерированный `nginx-init.conf`: это должен быть файл. Ошибка `[::]:80 failed (97: Address family not supported)` на хосте с отключённым IPv6 означает, что в конфиг ошибочно попал IPv6 listener. Не останавливайте рабочий Caddy ради диагностики: при его наличии установщик использует его webroot.
 
 ## Скрипт: `$'\r': command not found`
 
@@ -120,11 +110,4 @@ CRLF-переносы после копирования с Windows без git: `
 
 ## Нет SSH после `ufw enable`
 
-UFW был выключен во время установки, и правила не применились. Через консоль хостера (замените `22` на `SSH_PORT`):
-
-```bash
-ufw allow 80/tcp
-ufw allow 443/tcp
-ufw allow from 172.16.0.0/12 to any port 22 proto tcp
-ufw reload
-```
+Различайте внешний SSH на 443/tcp и соединение из контейнера sslh к порту sshd на хосте. Убедитесь через консоль хостера, что sshd слушает нужный адрес и `SSH_PORT`, 443/tcp открыт в панели провайдера, а UFW разрешает **интерфейс фактического bridge проекта** → порт sshd. Произвольное правило для `172.16.0.0/12` не покрывает пользовательский пул Docker. До проверки второго входа держите рабочую SSH-сессию и консоль восстановления доступными.

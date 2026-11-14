@@ -25,9 +25,10 @@
 | **Caddy** | Терминирует TLS сертификатом Let's Encrypt. `/game` проксирует в XRay по **h2c**, остальное отдаёт фейковым сайтом. Обслуживает `:80` для ACME-challenge |
 | **3x-ui / XRay** | Панель управления и XRay. Inbound принимает xhttp **без TLS** (`security: none`) — TLS уже снят Caddy |
 | **hysteria** | Опциональный QUIC/UDP-транспорт на `:443/udp` — [docs/hysteria.md](hysteria.md) |
-| **warp** | Только при `PROXY_MODE=warp` — [docs/outbound.md](outbound.md) |
+| **warp** | Для рабочего выхода — MicroWARP с Hev, TCP и UDP через WireGuard. Нужен только при `PROXY_MODE=warp` — [docs/outbound.md](outbound.md) |
 | **certbot** | Проверяет обновление сертификата каждые 12 часов |
-| **cron** | Reload Caddy после renewal (4:00) и обновление образов (вс, 3:00) |
+| **cron** | Перечитывание сертификата Caddy и недельное обновление образов; часы зависят от часового пояса хоста |
+| **systemd timer** | На действующем VPS — отдельное окно geodata, 04:00 НСК; не часть базового Compose |
 
 ## Почему TLS снимает Caddy, а не XRay
 
@@ -43,41 +44,17 @@ Caddy проксирует в XRay по h2c, где дуплекс штатны�
 
 Обратная сторона: в `stream-one` каждое соединение приложения — отдельный HTTP/2-запрос внутри общей трубы, и на него действуют таймауты Caddy для запросов. Их пришлось поднять — [docs/network.md](network.md#таймауты-простоя).
 
+
 ## Структура файлов
 
-```
-.
-├── setup-3xui.sh                # скрипт установки
-├── docker-compose.yml           # основной стек
-├── docker-compose.warp.yml      # override для PROXY_MODE=warp
-├── docker-compose.hysteria.yml  # override для Hysteria2 (QUIC/UDP)
-├── .env.example                 # шаблон переменных
-├── tools/
-│   └── xui-link.py              # чинит ссылку из панели → рабочая ссылка + JSON
-├── config/
-│   ├── caddy/
-│   │   └── Caddyfile            # шаблон конфига Caddy (TLS-фронт + фейковый сайт)
-│   ├── nginx/
-│   │   └── nginx-init.conf      # временный nginx для первичного certbot
-│   ├── hysteria/
-│   │   └── config.yaml          # шаблон конфига Hysteria2 (пароль из .env)
-│   └── xray/                    # шаблоны для вставки в панель вручную
-│       ├── outbound-warp.json   # outbound через Cloudflare WARP
-│       ├── outbound-vps.json    # outbound через exit VPS (VLESS)
-│       ├── routing-warp.json    # правило маршрутизации в warp-out
-│       ├── routing-vps.json     # правило маршрутизации в vps-out
-│       ├── routing-direct.json  # запасное правило: напрямую, если прокси лёг
-│       └── policy.json          # connIdle 1800 вместо 300 — не рвать долгие стримы
-├── docs/                        # документация
-└── html/
-    └── index.html               # фейковый корпоративный сайт
-```
+| Расположение | Назначение |
+|---|---|
+| [setup-3xui.sh](../setup-3xui.sh), [.env.example](../.env.example) | Установка и выбор сети, выхода и транспорта |
+| [docker-compose.yml](../docker-compose.yml) | sslh, Caddy, 3x-ui и Certbot; приватная сеть и тома |
+| [warp](../docker-compose.warp.yml) + [warp-udp](../docker-compose.warp-udp.yml) | Первый файл добавляет MicroWARP; второй заменяет SOCKS-процесс на Hev. Сборка в [config/warp](../config/warp) |
+| [ipv6](../docker-compose.ipv6.yml), [hysteria](../docker-compose.hysteria.yml) | Опции: IPv6 в сети проекта и отдельный UDP-вход соответственно |
+| [config/caddy](../config/caddy), [config/nginx](../config/nginx), [html](../html) | Шаблон постоянного TLS-фронта, временный HTTP для первичного ACME, содержимое сайта |
+| [config/xray](../config/xray) | Фрагменты для панели, эталон действующей маршрутизации и отдельный файл ожидающего правила. Xray сам эти файлы не читает |
+| [tools](../tools), [config/systemd](../config/systemd) | Генератор клиента, активные пробы, утилиты обслуживания и отдельные миграции. Назначение и ограничения — в [эксплуатации](operations.md) |
 
-После запуска скрипта в корне появятся:
-
-```
-├── Caddyfile                    # сгенерированный конфиг Caddy (из config/caddy/)
-├── nginx-init.conf              # временный конфиг (можно удалить после установки)
-├── certbot/                     # SSL-сертификаты
-└── logs/                        # логи 3x-ui, certbot (Caddy пишет в stdout)
-```
+Панель хранит настройки и клиентов в Docker-томе; сгенерированный runtime внутри контейнера — результат, а не место ручной правки. На хосте установка создаёт рабочий Caddyfile, каталог сертификатов и логи. Ссылки клиентов, БД, WireGuard-профиль, бэкапы и сгенерированные конфиги с паролями не должны попадать в Git.

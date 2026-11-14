@@ -1,0 +1,12 @@
+[Unit]
+Description=Daily Xray geodata update at 04:00 Novosibirsk
+
+[Timer]
+OnCalendar=*-*-* 04:00:00 Asia/Novosibirsk
+AccuracySec=1s
+RandomizedDelaySec=0
+Persistent=false
+Unit=xui-geodata-update.service
+
+[Install]
+WantedBy=timers.target
