@@ -1,0 +1,8 @@
+# WARP TCP/UDP profile: kernel WireGuard with Hev instead of MicroSOCKS.
+# Build locally with the base + warp + this override. Keep all three when updating.
+services:
+  warp:
+    image: local/microwarp-hev:0.3.1-hev2.13.1
+    pull_policy: never
+    build:
+      context: ./config/warp

@@ -1,0 +1,30 @@
+{
+  "outbounds": [
+    {
+      "tag": "direct",
+      "protocol": "freedom",
+      "settings": {
+        "finalRules": [
+          {
+            "action": "block",
+            "ip": ["geoip:private"]
+          },
+          {
+            "action": "block",
+            "network": "tcp",
+            "port": "443",
+            "ip": [
+              "188.43.61.141",
+              "80.64.175.142",
+              "89.113.122.236"
+            ],
+            "blockDelay": "0"
+          },
+          {
+            "action": "allow"
+          }
+        ]
+      }
+    }
+  ]
+}

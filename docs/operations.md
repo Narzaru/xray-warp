@@ -1,30 +1,89 @@
 # Эксплуатация
 
-Команды выполняются из директории проекта (`/opt/x-ui`). При `PROXY_MODE=warp` или `HYSTERIA=on` добавляйте соответствующие `-f docker-compose.*.yml` — иначе `up -d --remove-orphans` снесёт их контейнеры.
+Команды ниже предназначены для оператора. Состояние рабочего VPS и отдельно ожидающие изменения зафиксированы в [сверке от 14 ноября](server-state.md).
+
+## Выбор Compose-файлов
+
+Для рабочего VPS используйте в Bash весь профиль:
 
 ```bash
-# Состояние
-docker compose ps
-
-# Логи
-docker compose logs -f 3x-ui        # панель и XRay
-docker compose logs -f caddy        # TLS-фронт
-docker compose logs -f sslh         # мультиплексор
-
-# Перезапуск
-docker compose restart 3x-ui
-docker exec caddy caddy reload --force --config /etc/caddy/Caddyfile   # Caddy без разрыва соединений
-
-# Обновить образы вручную
-docker compose pull && docker compose up -d
-
-# То же с WARP
-docker compose -f docker-compose.yml -f docker-compose.warp.yml pull
-docker compose -f docker-compose.yml -f docker-compose.warp.yml up -d
-
-# Сгенерированный XRay-конфиг
-docker exec 3x-ui cat /app/bin/config.json
+cd /opt/x-ui
+dc=(docker compose -f docker-compose.yml -f docker-compose.warp.yml -f docker-compose.warp-udp.yml)
+"${dc[@]}" ps --all
+"${dc[@]}" logs --tail 40 3x-ui caddy sslh warp certbot
 ```
+
+На другой установке берите набор, выведенный её установщиком: базовый файл, при выбранном IPv6 bridge — `docker-compose.ipv6.yml`, для WARP — `docker-compose.warp.yml`, для Hev также `docker-compose.warp-udp.yml`, для Hysteria — `docker-compose.hysteria.yml`. Сокращённый набор с `up --remove-orphans` может удалить рабочий сервис. Команды просмотра (`ps`, `logs`) не применяют конфигурацию.
+
+## Назначение утилит
+
+| Утилита | Что она делает |
+|---|---|
+| [xui-link.py](../tools/xui-link.py) | Генерирует клиентские ссылку и JSON локально. Не требует доступа к VPS |
+| [probe-stack.py](../tools/probe-stack.py), [probe-warp-socks.py](../tools/probe-warp-socks.py), [probe-warp.sh](../tools/probe-warp.sh) | **Активные** сетевые и нагрузочные пробы. Серверный режим может создавать файлы, запускать временные процессы или контейнеры. Не применять для пассивного аудита |
+| [update-containers.py](../tools/update-containers.py) | Ограниченный ручной сценарий обновления Caddy. Не заменяет недельный cron |
+| [update-geodata.py](../tools/update-geodata.py) | Проверка пары баз, ночное применение и одна специально предусмотренная заявка на маршрут |
+| [sslh-numeric.py](../tools/sslh-numeric.py), [xray-direct.py](../tools/xray-direct.py), [enable-warp.py](../tools/enable-warp.py), [block-ru.py](../tools/block-ru.py), [deploy-warp-hev.py](../tools/deploy-warp-hev.py) | Миграции прежних состояний конкретного VPS. Не шаги новой установки. Используйте инструкции панели для нового сервера |
+
+Ручные updater-скрипты и systemd units рассчитаны на **`/opt/x-ui`, проект `x-ui`, Linux x86_64, IPv4 bridge, пять сервисов и текущий XHTTP/Hev**. Это другой объём поддержки, чем у установщика. Не переносите их на произвольный профиль вместе с cron. Устанавливать обновлённый geodata-скрипт следует вместе с совместимыми версиями `update-containers.py` и `probe-stack.py`.
+
+## Проверяемое обновление при возможном обрыве SSH
+
+`tools/update-containers.py` предназначен для текущего VPS и запускается от
+root. Без аргументов он берёт lock, читает состояние Docker, в том числе командами внутри контейнеров, и показывает план без обновления образов или пересоздания сервисов.
+`--prepare` обновляет четыре registry-образа и проверяет локальный образ WARP
+без `pull` или пересборки, сравнивает все пять ID с работающими,
+проверяет Caddyfile и полный конфиг Xray отдельными временными контейнерами,
+а также проверяет реальный VLESS/XHTTP → WARP. Рабочие контейнеры на этом
+этапе не перезапускаются. Закрытые артефакты лежат в
+`/opt/x-ui/backups/container-update-<UTC>`; они содержат клиентские UUID.
+
+Поддерживаемое изменение — Caddy до проверенной версии 2.11.8. Если меняется
+образ другого сервиса, подготовка останавливается до развёртывания: для
+панели/БД, WARP и sslh нужна отдельная проверка совместимости. Если все ID
+совпали, применение завершится успешно без пересоздания контейнеров.
+
+Подготовку и применение запускают последовательно отдельными systemd-службами,
+чтобы обрыв клиентского соединения не остановил процесс. Пример подготовки:
+
+```bash
+python3 /opt/x-ui/tools/test-update-containers.py
+python3 /opt/x-ui/tools/update-containers.py
+systemd-run --unit=xui-update-prepare --property=Type=exec \
+  --property=RuntimeMaxSec=30min --property=TimeoutStopSec=180 \
+  /usr/bin/python3 /opt/x-ui/tools/update-containers.py --prepare
+journalctl -u xui-update-prepare
+```
+
+После успешной подготовки нужно прочитать её результат, выбрать выведенный
+каталог и применить **его же** (план действителен один час):
+
+```bash
+systemd-run --unit=xui-update-apply --property=Type=exec \
+  --property=RuntimeMaxSec=10min --property=TimeoutStopSec=180 \
+  /usr/bin/python3 /opt/x-ui/tools/update-containers.py --apply \
+  /opt/x-ui/backups/container-update-YYYYMMDDTHHMMSSZ
+journalctl -u xui-update-apply
+```
+
+Применение повторно проверяет исходные контейнеры и хеши файлов, сохраняет
+состояние Caddy и сертификаты, использует проверенный immutable image ID
+и пересоздаёт только Caddy. Certbot кратковременно останавливается для согласованной резервной копии сертификатов, затем запускается вновь. Проверяет healthy, реальный VLESS/XHTTP → WARP
+и SSH через sslh. Ошибка после начала пересоздания запускает откат на старый
+образ с повторной проверкой прокси. Скрипт не меняет входы, маршрутизацию,
+БД панели, firewall или сетевые параметры хоста.
+
+Сценарии offline-проверки включают: успех, отсутствие обновлений, изменение
+конфига после подготовки, ошибка резервирования, частичная ошибка
+пересоздания, отсутствие healthy, ошибка XHTTP и ошибка SSH. Это проверка
+логики обработки отказов, а не гарантия от отказа Docker daemon или VPS.
+
+С 8 ноября 2026 текущий VPS использует третий compose-файл
+`docker-compose.warp-udp.yml`: kernel WireGuard MicroWARP и Hev SOCKS5 с TCP/UDP.
+Еженедельный cron также использует три файла, `pull --ignore-buildable` и
+`up --no-build --pull never`. Общий lock исключает пересечение cron с ручным
+развёртыванием. Локальный WARP обновляется отдельной проверенной сборкой.
+Подробности, результаты переключения и откат — в [outbound.md](outbound.md).
 
 ## Изменения Caddyfile
 
@@ -39,16 +98,103 @@ docker exec caddy caddy reload --config /etc/caddy/Caddyfile
 
 ## Автоматика
 
+### Отдельное обновление GeoIP и GeoSite
+
+`xui-geodata-update.timer` запускает `tools/update-geodata.py` ежедневно ровно
+в **04:00 Asia/Novosibirsk** (21:00 UTC предыдущего дня), без случайного сдвига.
+`Persistent=false`: после дневного включения VPS пропущенное применение не
+догоняется. Сам скрипт запрещает изменять рабочий стек вне 04:00–04:29 НСК.
+Запуск вручную `--nightly` днём также завершится до изменений.
+
+Источник — полный набор **Loyalsoldier/v2ray-rules-dat**, как в установленном
+образе. Оба файла берутся из одного конкретного GitHub release. Это сохраняет
+назначение `geoip:ru`, `geoip:private` и `geosite:category-ru`; списки
+RunetFreedom `ru-blocked` ими не подменяются. Обновление геоданных не меняет
+порядок правил и не отменяет блокировку российских IP, включая российские
+видеокэши зарубежных сервисов.
+
+Отдельно одобрено одно точное исключение для найденного видеокэша:
+см. [outbound.md](outbound.md#точечное-исключение-для-найденного-видеокэша).
+Оно ставится в очередь, а не применяется днём. В ночной транзакции проверяются
+ожидаемые хеши шаблона/конфига; CAS меняет только `xrayTemplateConfig`, затем
+панель генерирует ожидаемый конфиг при том же restart. Применённое исключение
+не включается повторно при ежедневных обновлениях официальных баз.
+
+Дневная подготовка `python3 /opt/x-ui/tools/update-geodata.py --prepare`
+скачивает пару, проверяет SHA256 из checksum-файлов и GitHub digest,
+ограничения размера, Protobuf и наличие нужных категорий. Затем штатный Xray
+из текущего образа проверяет фактический конфиг и запускается в отдельном
+контейнере **без сети, публикации портов и доступа к рабочей БД**. Подготовка пишет резервные файлы на хосте, но
+не меняет активные файлы, Compose, контейнеры или маршрутизацию.
+
+Первый ночной запуск подключает `/opt/x-ui/geodata` только к `3x-ui` в режиме
+read-only, задаёт `XRAY_LOCATION_ASSET=/var/lib/xray/geodata/current` и
+пересоздаёт только `3x-ui`. Перед этим SHA256 исходного Compose должен
+совпасть с `/opt/x-ui/geodata-bootstrap-plan.json`; чужие изменения скрипт не
+перезапишет. Mount и env записываются в базовый Compose ночью, поэтому
+существующее недельное обновление образов их сохраняет. Остальные контейнеры
+не пересоздаются. Исходный Compose, конфиг, контейнер и SQLite сохраняются
+в закрытом каталоге `/opt/x-ui/backups/geodata-<UTC>-<PID>/`.
+
+Версии лежат в `/opt/x-ui/geodata/releases/<release>/`. `current` — относительная
+ссылка внутри смонтированного родительского каталога; переключение атомарное.
+При изменившейся паре перезапускается только контейнер `3x-ui` (панель и Xray),
+поскольку поддержанной CLI-команды отдельного перезапуска Xray нет. Активные
+прокси-соединения при этом разрываются. После старта проверяются mount/env,
+хеши активных файлов, соответствие runtime ожидаемому конфигу (с учётом одобренного правила) и реальный XHTTP → WARP
+для HTTPS Cloudflare и UDP DNS. Запросы к Google/YouTube не используются.
+
+При неизменившейся и ранее подтверждённой паре перезапуска нет. Первый
+bootstrap всё равно выполняется даже при совпадении файлов. Durable markers
+`pending.json` и `last-applied.json` не позволяют после аварии спутать
+переключённые на диске файлы с уже загруженными ядром данными. Незавершённая
+транзакция восстанавливается следующей ночью перед новой попыткой.
+
+При ошибке применения автоматически возвращаются прежние `current`, Compose
+и `3x-ui`, затем отдельно проверяется прежняя пара. Отчёт об откате —
+`rollback-result.json`, о восстановлении после аварии — `crash-recovery.json`.
+При посторонних изменениях Compose восстановление останавливается для
+ручной проверки. SQLite автоматически не откатывается поверх пользовательских
+изменений; резервная копия предназначена для осознанного восстановления.
+Сохраняются семь последних каталогов запуска и необходимые для их отката
+версии; текущая, pending и подтверждённая версии защищены от очистки.
+
+```bash
+systemctl status xui-geodata-update.timer
+systemctl list-timers --all xui-geodata-update.timer
+journalctl -u xui-geodata-update.service --since yesterday
+cat /opt/x-ui/geodata/last-applied.json
+# Отчёт и данные для отката — в каталоге report из last-applied.json:
+# transaction.before.json, previous-assets/, base.before.yml, rollback.compose.json
+```
+
+Состояние установки 14 ноября 2026: дневной preflight проверяет кандидата;
+первый bootstrap и загрузка активных данных запланированы на **15 ноября,
+04:00 НСК**. Успех первого ночного применения проверяется отдельно по журналу
+и `SUCCESS.json`, наличие включённого timer само по себе его не подтверждает.
+Ожидающее исключение видно в `/opt/x-ui/pending-youtube-cache-exception.json`;
+его отсутствие после запуска вместе с успешным отчётом означает завершение
+одобренной операции. В каталоге запуска `routing-change.json` хранит прежний
+и новый шаблон для точечного CAS-отката (доступ только root).
+
 `/etc/cron.d/xray-cert-reload`:
 
 | Когда | Что |
 |---|---|
-| ежедневно 4:00 | `caddy reload --force` — подхватить обновлённый сертификат (+ рестарт hysteria) |
-| вс 3:00 | `pull` + `up -d` — обновление всех образов |
+| ежедневно 04:00 по часам cron | `caddy reload --force` — подхватить обновлённый сертификат (рестарт Hysteria только при её включении) |
+| вс 03:00 по часам cron | Обновление образов из реестров под lock; локальный Hev не скачивается и не пересобирается |
+
+На текущем хосте cron следует UTC: это 11:00 и 10:00 НСК соответственно. Дневное перечитывание Caddy не является ночным перезапуском Xray.
 
 Логи: `/var/log/xray-cert-reload.log`, `/var/log/xray-image-update.log`.
 
 > Образы тянутся по плавающим тегам (`latest`, `caddy:2-alpine`), поэтому вместе с обновлением приезжают и смены дефолтов. Так пришёл 60-секундный таймаут Caddy 2.11 ([docs/network.md](network.md#таймауты-простоя)). Если что-то сломалось в понедельник — смотрите логи контейнеров и `docker image ls`.
+
+## Подключение автоматики на отдельной установке того же профиля
+
+Обычный установщик **не** включает таймер геоданных. Для совместимого хоста сначала должен работать XHTTP → WARP, а шаблон, права, каталог и Compose должны отвечать условиям выше. В новом каталоге проекта заранее создайте закрытый каталог артефактов: `install -d -m 0700 /opt/x-ui/backups`. Подготовку проводят отдельно под root: `python3 tools/update-geodata.py --prepare` оставляет закрытый каталог с `plan.json`, исходным и кандидатным Compose. Временные контейнеры и скачивание файлов — часть этой операции. Сверьте изменения перед первой активацией.
+
+Для установки по этому плану скопируйте проверенный `plan.json` в `/opt/x-ui/geodata-bootstrap-plan.json` с правами 0600, установите оба [unit-файла](../config/systemd) в `/etc/systemd/system/`, затем выполните `systemctl daemon-reload` и `systemctl enable --now xui-geodata-update.timer`. Запускается **таймер**; первый bootstrap службы произойдёт в окне обслуживания. Постановка исключения — отдельная операция `--queue-youtube-cache`, только если нужна именно эта политика. Эти действия на текущем VPS уже подготовлены; повторно создавать план или заявку не требуется.
 
 ## Логи и место
 
@@ -58,3 +204,15 @@ docker exec caddy caddy reload --config /etc/caddy/Caddyfile
 du -sh /var/lib/docker/containers/*/
 du -sh logs/*
 ```
+
+
+## Воспроизводимые проверки без VPS
+
+В корне локального checkout на машине с Bash, Python 3 и Compose v2:
+
+```bash
+bash tools/test-setup-network.sh
+for t in tools/test-*.py; do python3 "$t" || exit 1; done
+```
+
+`test-compose-profiles.py` проверяет итоговую конфигурацию 12 комбинаций: два варианта bridge × без WARP / MicroSOCKS / Hev × с Hysteria или без неё. Для отдельного бинарника Compose v2 задайте `COMPOSE_BINARY`. Docker daemon этому тесту не нужен. Остальные тесты проверяют выбор сети и DNS, маршруты Xray, генерацию ссылок, конфликты SQLite и сценарии отказа/отката на тестовых данных. Доступ к VPS и клиентские ключи не нужны. Эти тесты не выдают сертификат и не проверяют реальную связность провайдера.

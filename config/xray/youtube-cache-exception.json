@@ -1,0 +1,8 @@
+{
+  "type": "field",
+  "inboundTag": ["in-10000-tcp"],
+  "network": "tcp,udp",
+  "port": "443",
+  "domain": ["full:rr2---sn-npcnxu-v8cs.googlevideo.com"],
+  "outboundTag": "warp-out"
+}

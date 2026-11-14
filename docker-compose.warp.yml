@@ -23,6 +23,9 @@ services:
       # только внутри xray-net, поэтому анонимный режим разрешён явно —
       # иначе учётные данные пришлось бы дублировать в outbound-warp.json.
       - ALLOW_NO_AUTH=1
+      # На этом развёртывании используется IPv4; не включать IPv6 внутри
+      # туннеля при отключённом IPv6 Docker-сети.
+      - ENABLE_IPV6=0
     sysctls:
       - net.ipv4.conf.all.src_valid_mark=1
     volumes:

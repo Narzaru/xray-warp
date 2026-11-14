@@ -1,0 +1,11 @@
+{
+  "domainStrategy": "IPOnDemand",
+  "rules": [
+    { "type": "field", "inboundTag": ["api"], "outboundTag": "api" },
+    { "type": "field", "inboundTag": ["in-10000-tcp"], "domain": ["geosite:category-ru"], "outboundTag": "blocked" },
+    { "type": "field", "inboundTag": ["in-10000-tcp"], "ip": ["geoip:ru"], "outboundTag": "blocked" },
+    { "type": "field", "ip": ["geoip:private"], "outboundTag": "blocked" },
+    { "type": "field", "protocol": ["bittorrent"], "outboundTag": "blocked" },
+    { "type": "field", "network": "tcp,udp", "outboundTag": "warp-out" }
+  ]
+}

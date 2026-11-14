@@ -2,3 +2,37 @@
 config/hysteria/config.generated.yaml
 .serena
 setup.log
+client-configs/
+geodata/
+geodata-bootstrap-plan.json
+pending-youtube-cache-exception.json
+
+# Local deployment state, credentials, certificates and maintenance snapshots
+.env
+/Caddyfile
+/nginx-init.conf
+/outbound-config.json
+/certbot/
+/logs/
+/backups/
+__pycache__/
+
+# Credentials and operator exports
+.ssh/
+.wg/
+wg0.conf
+*.pcap
+*.pcapng
+.env.*
+!.env.example
+*.har
+*.pem
+*.key
+*.p12
+*.pfx
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+*.log

@@ -12,7 +12,7 @@ ssh -L 2053:localhost:2053 -p 443 root@yourdomain.com
 ssh -L 2053:localhost:2053 root@yourdomain.com
 ```
 
-Браузер: `http://localhost:2053`, логин `admin` / пароль `admin`.
+Адрес в браузере — `http://127.0.0.1:2053` плюс путь панели, если он задан. Используйте учётные данные своей установки; у существующего VPS их нельзя вывести из Compose. При первом входе замените начальный пароль.
 
 ## Inbound
 
@@ -27,10 +27,13 @@ ssh -L 2053:localhost:2053 root@yourdomain.com
 | Host | `yourdomain.com` |
 | Mode | `auto` (режим выбирает клиент) |
 | Security | **None** |
+| Sniffing для политики рабочего VPS | Включить HTTP, TLS, QUIC; `routeOnly: true`, `metadataOnly: false` |
 
 > ⚠️ **Security именно `None`.** TLS снимает Caddy ([почему](architecture.md#почему-tls-снимает-caddy-а-не-xray)). Если включить TLS и здесь, Caddy будет слать h2c в TLS-порт, и туннель не поднимется. Пути к сертификатам не нужны.
 
 Затем **Settings → Xray Configs → Advanced**: заменить блок `policy` на `config/xray/policy.json` и **Restart XRay** — иначе XRay рвёт соединения, молчащие 5 минут ([подробно](network.md#xray-connidle)).
+
+В рабочей политике правила РФ привязаны к тегу `in-10000-tcp`. Если панель сгенерировала другое имя, подставьте его в оба правила. Не меняйте служебный вход API.
 
 При `PROXY_MODE=warp` или `vps` — ещё outbound и правила маршрутизации: [docs/outbound.md](outbound.md).
 
@@ -70,7 +73,19 @@ python3 tools/xui-link.py '<ссылка из панели>'
 python3 tools/xui-link.py '<ссылка>' --mode packet-up --connections 2-4  # другой режим и число соединений
 python3 tools/xui-link.py '<ссылка>' --ip 203.0.113.10                   # IP в dns.hosts
 python3 tools/xui-link.py '<ссылка>' --link-only                         # только ссылка
+python3 tools/xui-link.py '<ссылка>' --output-dir client-configs/example    # link.txt и config.json
+python3 tools/xui-link.py '<ссылка>' --reusable-secs 900-1800 --keepalive 0
 ```
+
+По умолчанию генератор задаёт `stream-up`, `maxConnections: "2-3"`,
+`hMaxRequestTimes: "600-900"`, `hMaxReusableSecs: "1800-3000"` и
+`hKeepAlivePeriod: 0` (стандартный интервал keepalive, не отключение).
+После истечения времени переиспользования старое соединение перестаёт
+принимать новые запросы, а текущие продолжаются до завершения.
+Ссылки и JSON содержат одинаковые `extra` и ALPN `h2`.
+Вместо IPv4 параметр `--ip` принимает и IPv6. Адрес подключения и имя TLS различаются: при подстановке IP сохраняйте SNI из сертификата. Без статической записи имя сервера должно разрешаться системным резолвером ещё до подключения.
+
+Папка `client-configs/` исключена из Git: результаты содержат UUID клиентов.
 
 ## Ручная настройка клиента
 
@@ -79,7 +94,7 @@ python3 tools/xui-link.py '<ссылка>' --link-only                         #
 | Address | `yourdomain.com` |
 | Port | **443** |
 | Protocol | VLESS, encryption `none` |
-| Transport | xHTTP, path `/game`, host `yourdomain.com`, mode `stream-one` |
+| Transport | xHTTP, path `/game`, host `yourdomain.com`, mode `stream-up` |
 | Security | TLS, SNI `yourdomain.com`, ALPN `h2`, fingerprint `firefox` |
 | Mux | **выключен** ([почему](network.md#xmux)) |
-| IPv6 | **выключен** (v2rayNG: «Enable IPv6») — [почему](network.md#ipv6) |
+| IPv6 в клиентском TUN | Для нынешнего IPv4-выхода выключен; на другой установке определяется доступностью IPv6 **у выхода** — [почему](network.md#ipv6) |

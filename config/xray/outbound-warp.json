@@ -14,16 +14,18 @@
     },
     {
       "tag": "direct",
-      "protocol": "freedom"
+      "protocol": "freedom",
+      "settings": {
+        "finalRules": [
+          { "action": "block", "ip": ["geoip:private"] },
+          { "action": "allow" }
+        ]
+      }
     },
     {
       "tag": "blocked",
       "protocol": "blackhole",
-      "settings": {
-        "response": {
-          "type": "http"
-        }
-      }
+      "settings": {}
     }
   ]
 }

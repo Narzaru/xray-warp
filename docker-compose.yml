@@ -22,10 +22,15 @@ services:
     # без этого сокеты работают на cubic, который на канале с потерями режет
     # окно вдвое на каждую потерю. Внешнее TCP-соединение с клиентом
     # терминирует sslh, поэтому здесь это критично.
+    #
+    # tcp_retries2=6: ТСПУ «замораживает» соединение молча, без RST, и на
+    # дефолтных 15 повторах мёртвый сокет висит ~15 минут. С 6 — около
+    # минуты (зависит от RTT), после чего sslh закрывает его и не копит мусор.
     sysctls:
       - net.ipv4.tcp_congestion_control=bbr
       - net.ipv4.tcp_rmem=4096 131072 8388608
       - net.ipv4.tcp_wmem=4096 16384 8388608
+      - net.ipv4.tcp_retries2=6
     networks:
       - xray-net
     depends_on:
@@ -117,15 +122,15 @@ services:
       - ./certbot/conf:/etc/letsencrypt
       - ./certbot/www:/var/www/certbot
       - ./logs/certbot:/var/log/letsencrypt
-    entrypoint: >-
-      /bin/sh -c 'trap exit TERM;
-      while :; do
-        certbot renew
-          --webroot
-          --webroot-path=/var/www/certbot
-          --quiet;
-        sleep 12h & wait $$!;
-      done'
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        trap 'exit 0' TERM
+        while :; do
+          certbot renew --webroot --webroot-path=/var/www/certbot --quiet
+          sleep 12h & wait $$!
+        done
     networks:
       - xray-net
     logging:
@@ -152,6 +157,9 @@ configs:
   sslh-cfg:
     content: |
       foreground: true;
+      # Обратный DNS при логировании может остановить весь sslh-select.
+      # Числовые адреса в логах; resolve_on_forward для бэкендов сохраняется.
+      numeric: true;
       listen: ( { host: "0.0.0.0"; port: "443"; } );
       protocols: (
         { name: "ssh";     host: "host.docker.internal"; port: "${SSH_PORT:-22}"; resolve_on_forward: true; },
